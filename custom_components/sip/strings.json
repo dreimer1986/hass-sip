@@ -219,7 +219,19 @@
         },
         "barge_in": {
           "name": "Barge-in",
-          "description": "Allow interrupting TTS responses by speaking (default false; may self-trigger on speakerphones without echo cancellation)."
+          "description": "Allow interrupting TTS responses by speaking (requires pymicro_vad; default false; may self-trigger on speakerphones without echo cancellation)."
+        },
+        "silence_seconds": {
+          "name": "Silence timeout",
+          "description": "Seconds of silence that end a spoken command. Assist defaults to 0.7; phone lines usually need 1.0-1.5 so callers are not cut off mid-sentence."
+        },
+        "noise_suppression": {
+          "name": "Noise suppression",
+          "description": "Noise suppression level applied to caller audio (0 = off, 4 = max). Helps on noisy narrowband G.711 lines."
+        },
+        "turn_tone": {
+          "name": "Turn start tone",
+          "description": "Play a short beep when it is the caller's turn to speak (default false). Helps callers know when the microphone is open after TTS. Skipped when barge-in already captured speech."
         },
         "hangup_on_end": {
           "name": "Hang up on end",

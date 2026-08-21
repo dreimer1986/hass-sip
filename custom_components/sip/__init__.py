@@ -42,15 +42,14 @@ from .const import (
 )
 from .helpers import get_ffmpeg_bin
 from .ivr import IvrSession
+from .sip_client.audio import FfmpegAudioSource, NullSink
+from .sip_client.sip_client import SipCallbacks, SipClient, SipConfig, SipState
 
 
 def _sip_device_id(hass: HomeAssistant, entry_id: str) -> str | None:
     """Return the device registry id for a SIP config entry, if created yet."""
     device = dr.async_get(hass).async_get_device(identifiers={(DOMAIN, entry_id)})
     return device.id if device else None
-
-from .sip_client.audio import FfmpegAudioSource, NullSink
-from .sip_client.sip_client import SipCallbacks, SipClient, SipConfig, SipState
 
 PLATFORMS = [
     Platform.SENSOR,
@@ -136,6 +135,13 @@ SERVICE_ASSIST_SCHEMA = cv.make_entity_service_schema(
         vol.Optional("max_turns"): vol.All(vol.Coerce(int), vol.Range(min=0)),
         vol.Optional("max_silent_turns"): vol.All(vol.Coerce(int), vol.Range(min=1)),
         vol.Optional("barge_in"): cv.boolean,
+        vol.Optional("silence_seconds"): vol.All(
+            vol.Coerce(float), vol.Range(min=0.3, max=5.0)
+        ),
+        vol.Optional("noise_suppression"): vol.All(
+            vol.Coerce(int), vol.Range(min=0, max=4)
+        ),
+        vol.Optional("turn_tone"): cv.boolean,
         vol.Optional("hangup_on_end"): cv.boolean,
     }
 )
@@ -397,6 +403,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         max_turns: int = 0,
         max_silent_turns: int = 2,
         barge_in: bool = False,
+        silence_seconds: float | None = None,
+        noise_suppression: int = 0,
+        turn_tone: bool = False,
         hangup_on_end: bool = False,
     ) -> None:
         nonlocal assist_bridge
@@ -412,7 +421,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             max_turns=max_turns,
             max_silent_turns=max_silent_turns,
             barge_in=barge_in,
+            silence_seconds=silence_seconds,
+            noise_suppression=noise_suppression,
+            turn_tone=turn_tone,
             stop_audio_fn=client.stop_audio,
+            media_playing_fn=lambda: client.media_playing,
         )
 
         def on_assist_done() -> None:
@@ -753,6 +766,9 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 "max_turns",
                 "max_silent_turns",
                 "barge_in",
+                "silence_seconds",
+                "noise_suppression",
+                "turn_tone",
                 "hangup_on_end",
             )
             if k in call.data

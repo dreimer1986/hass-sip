@@ -43,6 +43,7 @@ def _load_pkg_module(name):
 g722 = _load_pkg_module("g722")
 codecs = _load_pkg_module("codecs")
 rtp_session = _load_pkg_module("rtp_session")
+audio = _load_pkg_module("audio")
 try:
     sip_client = _load_pkg_module("sip_client")
 except AttributeError:  # enum.StrEnum needs Python 3.11+ (CI runs 3.12+)
@@ -52,7 +53,7 @@ except AttributeError:  # enum.StrEnum needs Python 3.11+ (CI runs 3.12+)
 # calls (FlowResult, cv.*). Stub those directly with setdefault so this works
 # standalone too — not just under pytest, where conftest.py already mocks
 # `homeassistant`/`homeassistant.core`/`homeassistant.config_entries`.
-from unittest.mock import MagicMock  # noqa: E402
+from unittest.mock import MagicMock, patch  # noqa: E402
 import voluptuous as vol  # noqa: E402
 
 for _mod_name in (
@@ -114,6 +115,50 @@ def test_g711_encode_decode_frame_length():
     assert len(enc) == 160
     dec = g711.decode(enc, 0)
     assert len(dec) == 320  # back to s16le
+
+
+# ------------------------------------------------------- ToneAudioSource
+def test_tone_audio_source_byte_count_and_fade():
+    async def instant_sleep(_delay=0, result=None):
+        return result
+
+    async def collect(rate, frame_bytes):
+        chunks = []
+        source = audio.ToneAudioSource()
+        source.configure(rate, frame_bytes)
+        await source.run(chunks.append, lambda: True)
+        return b"".join(chunks)
+
+    async def main():
+        with patch.object(audio.asyncio, "sleep", instant_sleep):
+            return await collect(8000, 320), await collect(16000, 640)
+
+    pcm8, pcm16 = asyncio.run(main())
+    assert len(pcm8) == 8000 * 120 // 1000 * 2
+    assert len(pcm16) == 16000 * 120 // 1000 * 2
+    samples8 = struct.unpack(f"<{len(pcm8) // 2}h", pcm8)
+    samples16 = struct.unpack(f"<{len(pcm16) // 2}h", pcm16)
+    assert abs(samples8[0]) <= 1
+    assert abs(samples8[-1]) <= 1
+    assert abs(samples16[0]) <= 1
+    assert abs(samples16[-1]) <= 1
+    assert max(abs(s) for s in samples8) > 1000
+    assert max(abs(s) for s in samples16) > 1000
+
+
+def test_tone_pcm_cache_reuses_rendered_bytes():
+    audio._TONE_PCM_CACHE.clear()
+    kwargs = {
+        "sample_rate": 8000,
+        "freq_hz": 880,
+        "duration_ms": 120,
+        "amplitude": 0.25,
+        "fade_ms": 10,
+    }
+    first = audio._render_tone_pcm(**kwargs)
+    second = audio._render_tone_pcm(**kwargs)
+    assert first is second
+    audio._TONE_PCM_CACHE.clear()
 
 
 # ------------------------------------------------------------ sip_message
@@ -451,6 +496,19 @@ def test_rtp_decoder_cache_reuses_stateful_decoder():
     assert asyncio.run(run())
 
 
+def test_rtp_flush_tx_buffer():
+    async def run():
+        session = rtp_session.RtpSession()
+        session.set_codec(codecs.PCMU)
+        session._transport = MagicMock()
+        session.push_tx_audio(b"\x00" * 640)
+        assert session._tx_buffer
+        session.flush_tx_buffer()
+        assert not session._tx_buffer
+
+    asyncio.run(run())
+
+
 def test_rtp_g722_frame_size_and_timestamp():
     async def run():
         session = rtp_session.RtpSession()
@@ -600,6 +658,7 @@ def _setup_assist_deps():
 
     class _PipelineEventType:
         RUN_START = "run-start"
+        STT_END = "stt-end"
         INTENT_END = "intent-end"
         TTS_END = "tts-end"
         ERROR = "error"
@@ -613,7 +672,14 @@ def _setup_assist_deps():
             self.type = event_type
             self.data = data if data is not None else {}
 
+    class _AudioSettings:
+        """Records the kwargs assist.py builds, so tests can assert on them."""
+
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
     mock_ap = MagicMock()
+    mock_ap.AudioSettings = _AudioSettings
     mock_ap.PipelineEventType = _PipelineEventType
     mock_ap.PipelineStage = _PipelineStage
     mock_ap.PipelineEvent = _PipelineEvent
@@ -801,7 +867,8 @@ def test_assist_playback_done_unblocks_next_turn():
         bridge.start()
         await asyncio.sleep(0.05)
         bridge._speaking = True
-        bridge._playback_done.clear()
+        bridge._tx_wait = "tts"
+        bridge._tx_done.clear()
         bridge.on_playback_done()
         if bridge.session_task:
             await bridge.session_task
@@ -818,8 +885,12 @@ def test_assist_playback_timeout_continues():
             MagicMock(),
             play_source_fn=MagicMock(),
             on_done_fn=MagicMock(),
+            stop_audio_fn=MagicMock(),
         )
         bridge._speaking = True
+        bridge._tts_epoch = 4
+        stale_task = asyncio.create_task(asyncio.sleep(60))
+        bridge._background_tasks.add(stale_task)
         real_timeout = asyncio.timeout
 
         def short_timeout(delay):
@@ -830,6 +901,159 @@ def test_assist_playback_timeout_continues():
         with um.patch("asyncio.timeout", short_timeout):
             await bridge._wait_playback_done()
         assert bridge._speaking is False
+        assert bridge._tts_epoch == 5
+        assert stale_task.cancelled()
+
+    asyncio.run(run())
+
+
+def test_assist_playback_timeout_stale_tts_does_not_play():
+    assist_mod, _, _, _ = _assist_ctx()
+    play_calls = []
+    release = asyncio.Event()
+
+    async def slow_stream():
+        await release.wait()
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = slow_stream
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=lambda src: play_calls.append(type(src).__name__),
+            on_done_fn=MagicMock(),
+            stop_audio_fn=MagicMock(),
+        )
+        bridge._speaking = True
+        task = asyncio.create_task(bridge._play_tts_stream(stream, epoch=1))
+        bridge._background_tasks.add(task)
+        await asyncio.sleep(0.02)
+        real_timeout = asyncio.timeout
+
+        def short_timeout(delay):
+            return real_timeout(0.05)
+
+        with patch("asyncio.timeout", short_timeout):
+            await bridge._wait_playback_done()
+        release.set()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    asyncio.run(run())
+    assert not play_calls
+
+
+def test_assist_playback_timeout_does_not_stop_long_playback():
+    assist_mod, _, _, _ = _assist_ctx()
+    stop_calls = []
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            stop_audio_fn=lambda **kw: stop_calls.append(kw),
+        )
+        bridge._speaking = True
+        real_timeout = asyncio.timeout
+
+        def short_timeout(delay):
+            return real_timeout(0.05)
+
+        with patch("asyncio.timeout", short_timeout):
+            await bridge._wait_playback_done()
+        assert not stop_calls
+        assert bridge._speaking is False
+
+    asyncio.run(run())
+
+
+def test_assist_tts_wait_timeout_is_generous():
+    """Real calls play 39-52s responses; the safety-net timeout must clear that
+    comfortably or every turn logs a spurious warning (seen at the old 30s)."""
+    assist_mod, _, _, _ = _assist_ctx()
+    assert assist_mod._TTS_WAIT_TIMEOUT_SECONDS >= 120
+    assert assist_mod._TONE_WAIT_TIMEOUT_SECONDS == 3
+
+
+def test_assist_wait_playback_done_waits_for_media_idle():
+    assist_mod, _, _, _ = _assist_ctx()
+    polls: list[int] = []
+    media_state = {"playing": True}
+
+    def media_fn() -> bool:
+        polls.append(1)
+        if len(polls) >= 3:
+            media_state["playing"] = False
+        return media_state["playing"]
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            media_playing_fn=media_fn,
+        )
+        bridge._speaking = True
+        bridge._tx_wait = "tts"
+        bridge._tx_done.set()
+        await bridge._wait_playback_done()
+        assert len(polls) >= 3
+        assert bridge._speaking is False
+
+    asyncio.run(run())
+
+
+def test_assist_turn_tone_defers_until_media_idle():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    play_calls: list[str] = []
+    media_state = {"playing": True}
+
+    async def mock_pipeline(hass, **kwargs):
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=lambda src: play_calls.append(type(src).__name__),
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+        turn_tone=True,
+        media_playing_fn=lambda: media_state["playing"],
+    )
+
+    async def run():
+        bridge.start()
+        await asyncio.sleep(0.05)
+        assert not play_calls
+        media_state["playing"] = False
+        bridge.on_playback_done()
+        if bridge.session_task:
+            await bridge.session_task
+
+    asyncio.run(run())
+    assert play_calls == ["ToneAudioSource"]
+
+
+def test_assist_wait_for_tx_idle_times_out():
+    assist_mod, _, _, _ = _assist_ctx()
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            media_playing_fn=lambda: True,
+        )
+        t0 = asyncio.get_running_loop().time()
+        with patch.object(assist_mod, "_TX_IDLE_TIMEOUT_SECONDS", 0.05):
+            await bridge._wait_for_tx_idle()
+        assert asyncio.get_running_loop().time() - t0 < 1.0
 
     asyncio.run(run())
 
@@ -967,8 +1191,6 @@ def test_assist_tts_failure_signals_playback_done():
     failing_stream.async_stream_result = failing_result
     mock_tts.async_get_stream.return_value = failing_stream
 
-    playback_done = asyncio.Event()
-
     async def mock_pipeline(hass, **kwargs):
         cb = kwargs["event_callback"]
         cb(PE(PET.TTS_END, {"tts_output": {"token": "tok"}}))
@@ -981,12 +1203,11 @@ def test_assist_tts_failure_signals_playback_done():
         on_done_fn=MagicMock(),
         max_turns=1,
     )
-    bridge._playback_done = playback_done
 
     async def run():
         bridge.start()
-        await asyncio.wait_for(playback_done.wait(), timeout=2)
-        assert playback_done.is_set()
+        await asyncio.wait_for(bridge._tx_done.wait(), timeout=2)
+        assert bridge._tx_done.is_set()
         if bridge.session_task:
             await bridge.session_task
 
@@ -999,7 +1220,40 @@ def test_assist_tts_failure_signals_playback_done():
 def test_assist_barge_in_triggers_stop_and_preroll():
     assist_mod, _, _, _ = _assist_ctx()
     original_min = assist_mod._VAD_MIN_SPEECH_FRAMES
+    original_micro_vad = assist_mod.MicroVad
     assist_mod._VAD_MIN_SPEECH_FRAMES = 2
+
+    class _StubVad:
+        def Process10ms(self, frame: bytes) -> float:
+            return 0.9
+
+    assist_mod.MicroVad = lambda: _StubVad()
+    try:
+        stop_calls = []
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            barge_in=True,
+            stop_audio_fn=lambda *, flush=False: stop_calls.append(flush),
+        )
+        bridge._speaking = True
+        frame = b"\x00\x01" * (assist_mod._VAD_FRAME_BYTES // 2)
+        for _ in range(5):
+            bridge.write(frame)
+        assert stop_calls == [True]
+        assert bridge._barge_in_preroll
+        assert bridge._tx_done.is_set()
+        assert bridge._post_barge_in_capture
+    finally:
+        assist_mod._VAD_MIN_SPEECH_FRAMES = original_min
+        assist_mod.MicroVad = original_micro_vad
+
+
+def test_assist_barge_in_disabled_without_micro_vad():
+    assist_mod, _, _, _ = _assist_ctx()
+    original_micro_vad = assist_mod.MicroVad
+    assist_mod.MicroVad = None
     try:
         stop_calls = []
         bridge = assist_mod.AssistBridge(
@@ -1009,15 +1263,104 @@ def test_assist_barge_in_triggers_stop_and_preroll():
             barge_in=True,
             stop_audio_fn=lambda: stop_calls.append(1),
         )
+        assert bridge.barge_in is False
         bridge._speaking = True
         loud = struct.pack("<160h", *([8000] * 160))
         for _ in range(5):
             bridge.write(loud)
-        assert stop_calls
-        assert bridge._barge_in_preroll
-        assert bridge._playback_done.is_set()
+        assert not stop_calls
+    finally:
+        assist_mod.MicroVad = original_micro_vad
+
+
+def test_assist_barge_in_cancels_inflight_tts():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_get_stream = mock_tts.async_get_stream.return_value
+    original_min = assist_mod._VAD_MIN_SPEECH_FRAMES
+    original_micro_vad = assist_mod.MicroVad
+    play_calls = []
+
+    class _StubVad:
+        def Process10ms(self, frame: bytes) -> float:
+            return 0.9
+
+    assist_mod.MicroVad = lambda: _StubVad()
+    assist_mod._VAD_MIN_SPEECH_FRAMES = 2
+
+    async def slow_stream():
+        await asyncio.sleep(0.15)
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = slow_stream
+    mock_tts.async_get_stream.return_value = stream
+
+    try:
+
+        async def mock_pipeline(hass, **kwargs):
+            cb = kwargs["event_callback"]
+            cb(PE(PET.TTS_END, {"tts_output": {"token": "tok"}}))
+
+        mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=lambda src: play_calls.append(1),
+            on_done_fn=MagicMock(),
+            barge_in=True,
+            stop_audio_fn=MagicMock(),
+            max_turns=1,
+            max_silent_turns=99,
+        )
+
+        async def run():
+            bridge.start()
+            await asyncio.sleep(0.02)
+            frame = b"\x00\x01" * (assist_mod._VAD_FRAME_BYTES // 2)
+            for _ in range(5):
+                bridge.write(frame)
+            if bridge.session_task:
+                await asyncio.wait_for(bridge.session_task, timeout=2)
+
+        asyncio.run(run())
+        assert not play_calls
     finally:
         assist_mod._VAD_MIN_SPEECH_FRAMES = original_min
+        assist_mod.MicroVad = original_micro_vad
+        mock_tts.async_get_stream.return_value = original_get_stream
+
+
+def test_assist_post_barge_in_capture_extends_preroll():
+    assist_mod, _, _, _ = _assist_ctx()
+    original_min = assist_mod._VAD_MIN_SPEECH_FRAMES
+    original_micro_vad = assist_mod.MicroVad
+
+    class _StubVad:
+        def Process10ms(self, frame: bytes) -> float:
+            return 0.9
+
+    assist_mod.MicroVad = lambda: _StubVad()
+    assist_mod._VAD_MIN_SPEECH_FRAMES = 2
+    try:
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            barge_in=True,
+            stop_audio_fn=MagicMock(),
+        )
+        bridge._speaking = True
+        frame = b"\x00\x01" * (assist_mod._VAD_FRAME_BYTES // 2)
+        for _ in range(5):
+            bridge.write(frame)
+        assert bridge._post_barge_in_capture
+        extra = b"\x02\x03" * 320
+        bridge.write(extra)
+        assert bridge._ring_buffer
+    finally:
+        assist_mod._VAD_MIN_SPEECH_FRAMES = original_min
+        assist_mod.MicroVad = original_micro_vad
 
 
 def test_assist_preroll_injected_into_stream():
@@ -1025,6 +1368,378 @@ def test_assist_preroll_injected_into_stream():
     stream = assist_mod.AssistAudioStream()
     stream.inject_preroll(b"\x00" * 640)
     assert stream.queue.qsize() == 1
+
+
+def test_assist_done_guard_skips_superseded_bridge():
+    """Regression: superseded bridge on_done must not clobber the active sink."""
+    state = {"assist_bridge": None, "sink": None}
+
+    def make_on_done(bridge):
+        def on_assist_done() -> None:
+            if state["assist_bridge"] is not bridge:
+                return
+            state["sink"] = "null"
+            state["assist_bridge"] = None
+
+        return on_assist_done
+
+    bridge_a = object()
+    bridge_b = object()
+    state["assist_bridge"] = bridge_b
+    state["sink"] = "bridge_b"
+    make_on_done(bridge_a)()
+    assert state["assist_bridge"] is bridge_b
+    assert state["sink"] == "bridge_b"
+
+
+def test_call_ended_restores_sink_when_assist_bridge_cleared():
+    """Regression: call end must restore sink even if on_assist_done guard no-ops."""
+    state = {"assist_bridge": object(), "sink": "bridge"}
+
+    def on_call_ended() -> None:
+        if state["assist_bridge"] is not None:
+            state["assist_bridge"] = None
+            state["sink"] = "null"
+
+    on_call_ended()
+    assert state["assist_bridge"] is None
+    assert state["sink"] == "null"
+
+
+def _run_one_turn(assist_mod, mock_ap, PET, PE, **bridge_kwargs):
+    """Run a single pipeline turn and return the kwargs it was called with."""
+    captured = {}
+
+    async def mock_pipeline(hass, **kwargs):
+        captured.update(kwargs)
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+        **bridge_kwargs,
+    )
+    _run_bridge_session(bridge)
+    return captured
+
+
+def test_assist_audio_settings_omitted_by_default():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    captured = _run_one_turn(assist_mod, mock_ap, PET, PE)
+    # None keeps Home Assistant's own AudioSettings() defaults.
+    assert captured["audio_settings"] is None
+
+
+def test_assist_audio_settings_passed_when_tuned():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    captured = _run_one_turn(
+        assist_mod, mock_ap, PET, PE, silence_seconds=1.2, noise_suppression=3
+    )
+    settings = captured["audio_settings"]
+    assert settings is not None
+    assert settings.kwargs == {"silence_seconds": 1.2, "noise_suppression_level": 3}
+
+
+def test_assist_audio_settings_partial_options():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    captured = _run_one_turn(assist_mod, mock_ap, PET, PE, silence_seconds=1.5)
+    assert captured["audio_settings"].kwargs == {"silence_seconds": 1.5}
+
+    captured = _run_one_turn(assist_mod, mock_ap, PET, PE, noise_suppression=2)
+    assert captured["audio_settings"].kwargs == {"noise_suppression_level": 2}
+
+
+def test_assist_stt_and_intent_text_extractors():
+    assist_mod, _, _, _ = _assist_ctx()
+    assert assist_mod._stt_text({"stt_output": {"text": "turn on the light"}}) == (
+        "turn on the light"
+    )
+    assert assist_mod._stt_text(None) == ""
+    assert assist_mod._stt_text({}) == ""
+    assert assist_mod._stt_text({"stt_output": None}) == ""
+
+    intent_output = {"response": {"speech": {"plain": {"speech": "Done."}}}}
+    assert assist_mod._intent_speech(intent_output) == "Done."
+    assert assist_mod._intent_speech({}) == ""
+    assert assist_mod._intent_speech({"response": {"speech": None}}) == ""
+
+
+def test_assist_stt_end_event_is_logged_without_error():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    turns = []
+
+    async def mock_pipeline(hass, **kwargs):
+        cb = kwargs["event_callback"]
+        turns.append(1)
+        cb(PE(PET.STT_END, {"stt_output": {"text": "hello"}}))
+        cb(PE(PET.INTENT_END, {"intent_output": {"response": {}}}))
+        cb(PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+    )
+    _run_bridge_session(bridge)
+    assert turns == [1]
+    assert bridge._turn_index == 1
+
+
+def test_assist_turn_tone_playback_done_does_not_set_tts_event():
+    """Trap 1: tone completion must not unblock TTS playback wait."""
+    assist_mod, _, _, _ = _assist_ctx()
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        turn_tone=True,
+    )
+    bridge._tx_wait = "tone"
+    bridge._tx_done.clear()
+    bridge.on_playback_done()
+    assert bridge._tx_done.is_set()
+
+    bridge._tx_wait = "tts"
+    bridge._tx_done.clear()
+    bridge.on_playback_done()
+    assert bridge._tx_done.is_set()
+
+    bridge._tx_wait = None
+    bridge._tx_done.clear()
+    bridge.on_playback_done()
+    assert not bridge._tx_done.is_set()
+
+
+def test_assist_stale_tone_done_ignored_after_wait_cleared():
+    assist_mod, _, _, _ = _assist_ctx()
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        turn_tone=True,
+    )
+    bridge._tx_wait = None
+    bridge._tx_done.clear()
+    bridge.on_playback_done()
+    assert not bridge._tx_done.is_set()
+
+
+def test_assist_turn_tone_listening_after_playback_done():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    listening_at_pipeline = []
+    play_calls = []
+
+    async def mock_pipeline(hass, **kwargs):
+        listening_at_pipeline.append(bridge._listening)
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+    def play_source(src):
+        play_calls.append(src)
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=play_source,
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+        turn_tone=True,
+    )
+
+    async def run():
+        bridge.start()
+        await asyncio.sleep(0.05)
+        assert bridge._listening is False
+        assert bridge._tx_wait == "tone"
+        assert play_calls
+        assert type(play_calls[0]).__name__ == "ToneAudioSource"
+        bridge.on_playback_done()
+        if bridge.session_task:
+            await bridge.session_task
+
+    asyncio.run(run())
+    assert listening_at_pipeline == [True]
+
+
+def test_assist_turn_tone_timeout_preserves_captured_speech():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    captured_chunks = []
+
+    async def mock_pipeline(hass, **kwargs):
+        stream = kwargs["stt_stream"]
+        captured_chunks.append(await asyncio.wait_for(stream.queue.get(), timeout=0.5))
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+        turn_tone=True,
+        stop_audio_fn=MagicMock(),
+    )
+    marker = b"\xab\xcd" * 80
+
+    async def run():
+        real_timeout = asyncio.timeout
+
+        def short_tone_timeout(delay):
+            if delay == 3:
+                return real_timeout(0.05)
+            return real_timeout(delay)
+
+        with patch("asyncio.timeout", short_tone_timeout):
+            bridge.start()
+            await asyncio.sleep(0.02)
+            bridge.write(marker)
+            if bridge.session_task:
+                await bridge.session_task
+
+    asyncio.run(run())
+    assert captured_chunks
+    assert b"\xab\xcd" in captured_chunks[0]
+
+
+def test_assist_turn_tone_success_does_not_inject_captured_speech():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    queue_sizes_at_pipeline = []
+
+    async def mock_pipeline(hass, **kwargs):
+        queue_sizes_at_pipeline.append(kwargs["stt_stream"].queue.qsize())
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+        turn_tone=True,
+    )
+    marker = b"\xef\xbe" * 80
+
+    async def run():
+        bridge.start()
+        await asyncio.sleep(0.02)
+        bridge.write(marker)
+        bridge.on_playback_done()
+        if bridge.session_task:
+            await bridge.session_task
+
+    asyncio.run(run())
+    assert queue_sizes_at_pipeline == [0]
+
+
+def test_assist_turn_tone_timeout_continues_turn():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    turns = []
+    stop_calls = []
+
+    async def mock_pipeline(hass, **kwargs):
+        turns.append(1)
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+    async def run():
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            max_silent_turns=1,
+            turn_tone=True,
+            stop_audio_fn=lambda **_kw: stop_calls.append(1),
+        )
+        real_timeout = asyncio.timeout
+
+        def short_timeout(delay):
+            return real_timeout(0.05)
+
+        with patch("asyncio.timeout", short_timeout):
+            bridge.start()
+            if bridge.session_task:
+                await bridge.session_task
+
+    asyncio.run(run())
+    assert turns == [1]
+    assert stop_calls
+
+
+def test_assist_turn_tone_skipped_when_preroll():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    play = MagicMock()
+
+    async def mock_pipeline(hass, **kwargs):
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=play,
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+        turn_tone=True,
+    )
+    bridge._barge_in_preroll = b"\x00\x00" * 320
+    _run_bridge_session(bridge)
+    play.assert_not_called()
+
+
+def test_assist_turn_tone_disabled_by_default():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    play = MagicMock()
+
+    async def mock_pipeline(hass, **kwargs):
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=play,
+        on_done_fn=MagicMock(),
+        max_silent_turns=1,
+    )
+    _run_bridge_session(bridge)
+    play.assert_not_called()
+    assert bridge.turn_tone is False
+
+
+def test_assist_close_unblocks_turn_tone_wait():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+
+    async def mock_pipeline(hass, **kwargs):
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        turn_tone=True,
+    )
+
+    async def run():
+        bridge.start()
+        task = bridge.session_task
+        await asyncio.sleep(0.05)
+        assert bridge._tx_wait == "tone"
+        t0 = asyncio.get_running_loop().time()
+        bridge.close()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        assert asyncio.get_running_loop().time() - t0 < 1.0
+
+    asyncio.run(run())
 
 
 # ------------------------------------------------------- config_flow schema
