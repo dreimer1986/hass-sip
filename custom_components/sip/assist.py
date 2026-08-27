@@ -10,6 +10,8 @@ from homeassistant.components.assist_pipeline import (
     AudioSettings,
     PipelineEvent,
     PipelineEventType,
+    PipelineInput,
+    PipelineRun,
     PipelineStage,
     async_get_pipeline,
     async_pipeline_from_audio_stream,
@@ -23,6 +25,7 @@ from homeassistant.components.stt import (
     SpeechMetadata,
 )
 from homeassistant.core import Context, HomeAssistant
+from homeassistant.helpers import chat_session
 
 from .const import LOGGER
 from .helpers import get_ffmpeg_bin
@@ -35,6 +38,10 @@ except ImportError:
 
 _SILENT_TURN_ERRORS = frozenset({"stt-no-text-recognized", "wake-word-timeout"})
 _MAX_CONSECUTIVE_ERRORS = 3
+# hangup_on_end callers want the call to end promptly once the caller has
+# stopped responding, rather than waiting through the full silent-turn
+# budget of a normal session.
+_HANGUP_ON_END_MAX_SILENT_TURNS = 1
 _ERROR_TURN_BACKOFF_SECONDS = 1.0
 _VAD_FRAME_BYTES = 320  # 10 ms @ 16 kHz s16le mono
 _VAD_SPEECH_THRESHOLD = 0.5
@@ -117,6 +124,9 @@ class AssistBridge(AudioSink):
         on_done_fn: Callable[[], None],
         *,
         pipeline_id: str | None = None,
+        conversation_id: str | None = None,
+        initial_prompt: str | None = None,
+        system_prompt: str | None = None,
         sample_rate: int = 8000,
         max_turns: int = 0,
         max_silent_turns: int = 2,
@@ -124,6 +134,7 @@ class AssistBridge(AudioSink):
         silence_seconds: float | None = None,
         noise_suppression: int = 0,
         turn_tone: bool = False,
+        hangup_on_end: bool = False,
         stop_audio_fn: Callable[..., None] | None = None,
         media_playing_fn: Callable[[], bool] | None = None,
     ) -> None:
@@ -132,9 +143,16 @@ class AssistBridge(AudioSink):
         self.play_source = play_source_fn
         self.on_done = on_done_fn
         self.pipeline_id = pipeline_id
+        self._conversation_id = conversation_id
+        self.initial_prompt = initial_prompt
+        self.system_prompt = system_prompt
         self.sample_rate = sample_rate
         self.max_turns = max_turns
         self.max_silent_turns = max_silent_turns
+        if hangup_on_end:
+            self.max_silent_turns = min(
+                self.max_silent_turns, _HANGUP_ON_END_MAX_SILENT_TURNS
+            )
         self.barge_in = barge_in
         self.silence_seconds = silence_seconds
         self.noise_suppression = noise_suppression
@@ -155,7 +173,6 @@ class AssistBridge(AudioSink):
         self._speaking = False
         self._tx_done = asyncio.Event()
         self._tx_wait: _TxWaitKind | None = None
-        self._conversation_id: str | None = None
         self._turn_error: str | None = None
         self._turn_index = 0
         self._continue_conversation = False
@@ -317,14 +334,26 @@ class AssistBridge(AudioSink):
             audio_settings = self._build_audio_settings()
             LOGGER.info(
                 "Starting Voice Assist session (pipeline_id=%s, sample_rate=%d, "
-                "barge_in=%s, silence_seconds=%s, noise_suppression=%d, turn_tone=%s)",
+                "barge_in=%s, silence_seconds=%s, noise_suppression=%d, "
+                "turn_tone=%s, initial_prompt=%s, system_prompt=%s)",
                 pipeline.id,
                 self.sample_rate,
                 self.barge_in,
                 self.silence_seconds if self.silence_seconds is not None else "default",
                 self.noise_suppression,
                 self.turn_tone,
+                bool(self.initial_prompt),
+                bool(self.system_prompt),
             )
+            if self.initial_prompt:
+                self._turn_error = None
+                self._continue_conversation = False
+                self._turn_index = 0
+                await self._run_initial_prompt(pipeline)
+                await self._wait_playback_done()
+                if not self._running:
+                    return
+
             while self._running:
                 self.audio_stream = AssistAudioStream()
                 preroll = self._barge_in_preroll
@@ -365,6 +394,7 @@ class AssistBridge(AudioSink):
                         audio_settings=audio_settings,
                         start_stage=PipelineStage.STT,
                         end_stage=PipelineStage.TTS,
+                        conversation_extra_system_prompt=self.system_prompt,
                     )
                 finally:
                     self._listening = False
@@ -431,6 +461,27 @@ class AssistBridge(AudioSink):
                 error_turns,
             )
             self.on_done()
+
+    async def _run_initial_prompt(self, pipeline) -> None:
+        """Run an opening text turn through intent and TTS."""
+        with chat_session.async_get_chat_session(
+            self.hass, self._conversation_id
+        ) as session:
+            pipeline_input = PipelineInput(
+                run=PipelineRun(
+                    self.hass,
+                    context=Context(),
+                    pipeline=pipeline,
+                    start_stage=PipelineStage.INTENT,
+                    end_stage=PipelineStage.TTS,
+                    event_callback=self._on_pipeline_event,
+                ),
+                session=session,
+                intent_input=self.initial_prompt,
+                conversation_extra_system_prompt=self.system_prompt,
+            )
+            await pipeline_input.validate()
+            await pipeline_input.execute()
 
     async def _play_turn_tone(self) -> bytes:
         """Play the turn-start beep and wait until it finishes.
@@ -526,7 +577,6 @@ class AssistBridge(AudioSink):
                 and (stream := tts.async_get_stream(self.hass, tts_output["token"]))
             ):
                 self._speaking = True
-                self._tx_wait = "tts"
                 self._tx_done.clear()
                 self._reset_barge_in_state()
                 self._tts_epoch += 1
@@ -556,6 +606,7 @@ class AssistBridge(AudioSink):
             if epoch != self._tts_epoch:
                 return
             self.play_source(source)
+            self._tx_wait = "tts"
         except Exception as err:
             LOGGER.exception("Error playing Assist TTS response: %s", err)
             if epoch == self._tts_epoch:

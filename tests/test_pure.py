@@ -53,7 +53,7 @@ except AttributeError:  # enum.StrEnum needs Python 3.11+ (CI runs 3.12+)
 # calls (FlowResult, cv.*). Stub those directly with setdefault so this works
 # standalone too — not just under pytest, where conftest.py already mocks
 # `homeassistant`/`homeassistant.core`/`homeassistant.config_entries`.
-from unittest.mock import MagicMock, patch  # noqa: E402
+from unittest.mock import AsyncMock, MagicMock, patch  # noqa: E402
 import voluptuous as vol  # noqa: E402
 
 for _mod_name in (
@@ -187,6 +187,33 @@ def test_parse_request():
     assert m.method == "INVITE"
     assert m.request_uri == "sip:100@pbx"
     assert m.header("call-id") == "xyz@host"
+
+
+def test_parse_combines_repeated_routing_headers_in_wire_order():
+    msg = sm.parse_sip_message(
+        "BYE sip:client@example SIP/2.0\r\n"
+        "Via: SIP/2.0/UDP first.example;branch=1\r\n"
+        "Via: SIP/2.0/UDP second.example;branch=2\r\n"
+        "Record-Route: <sip:first.example;lr>\r\n"
+        "Record-Route: <sip:second.example;lr>\r\n\r\n"
+    )
+    assert msg.header("Via") == (
+        "SIP/2.0/UDP first.example;branch=1, "
+        "SIP/2.0/UDP second.example;branch=2"
+    )
+    assert msg.header("Record-Route") == (
+        "<sip:first.example;lr>, <sip:second.example;lr>"
+    )
+
+
+def test_split_header_values_ignores_nested_commas():
+    assert sm.split_header_values(
+        '"Proxy, One" <sip:first.example;lr>, '
+        '<sip:second.example?Subject=hello,world;lr>'
+    ) == [
+        '"Proxy, One" <sip:first.example;lr>',
+        '<sip:second.example?Subject=hello,world;lr>',
+    ]
 
 
 def test_parse_sdp():
@@ -354,6 +381,418 @@ def test_info_dtmf_ignores_other_content():
     assert p("application/sdp", "Signal=1") is None
     assert p("application/dtmf-relay", "") is None
     assert p("application/dtmf-relay", "Duration=160") is None
+
+
+def test_response_copies_complete_via_chain():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        request = sm.parse_sip_message(
+            "BYE sip:alice@example SIP/2.0\r\n"
+            "Via: SIP/2.0/UDP first.example;branch=1\r\n"
+            "Via: SIP/2.0/UDP second.example;branch=2\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>;tag=local\r\n"
+            "Call-ID: call@example\r\n"
+            "CSeq: 1 BYE\r\n\r\n"
+        )
+        return client._build_response(request, 200, "OK", False)
+
+    response = asyncio.run(run())
+    assert (
+        "Via: SIP/2.0/UDP first.example;branch=1, "
+        "SIP/2.0/UDP second.example;branch=2\r\n"
+    ) in response
+
+
+def test_successful_invite_ack_and_bye_use_reversed_record_route():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client._local_ip = "192.0.2.10"
+        client._local_port = 5060
+        client._outbound = True
+        client._d_call_id = "call@example"
+        client._d_local = "<sip:alice@example>;tag=local"
+        client._d_remote = "<sip:bob@example>"
+        client._d_remote_target = "sip:bob@example"
+        client._d_cseq = 2
+        client._invite_cseq = 2
+        client.registered = True
+        client.state = sip_client.SipState.RINGING_OUT
+        response = sm.parse_sip_message(
+            "SIP/2.0 200 OK\r\n"
+            "Record-Route: <sip:first.example;lr>,<sip:middle.example;lr>\r\n"
+            "Record-Route: <sip:last.example;lr>\r\n"
+            "To: <sip:bob@example>;tag=remote\r\n"
+            "Contact: <sip:bob@target.example>\r\n"
+            "Call-ID: call@example\r\n"
+            "CSeq: 2 INVITE\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with (
+            patch.object(client, "_send_raw") as send,
+            patch.object(client, "_apply_remote_sdp"),
+            patch.object(client, "_start_media", AsyncMock()) as start_media,
+        ):
+            client._handle_invite_response(response)
+            first_ack = send.call_args_list[0].args[0]
+            client._handle_invite_response(response)
+            repeated_ack = send.call_args_list[1].args[0]
+            client.hangup()
+            local_bye = send.call_args_list[2].args[0]
+            client._handle_invite_response(response)
+            delayed_ack = send.call_args_list[3].args[0]
+            await asyncio.sleep(0)
+        return (
+            first_ack,
+            repeated_ack,
+            delayed_ack,
+            local_bye,
+            start_media.await_count,
+            client.state,
+            client._d_cseq,
+            client._invite_cseq,
+        )
+
+    (
+        first_ack,
+        repeated_ack,
+        delayed_ack,
+        bye,
+        media_starts,
+        state,
+        dialog_cseq,
+        invite_cseq,
+    ) = asyncio.run(run())
+    expected = (
+        "Route: <sip:last.example;lr>, <sip:middle.example;lr>, "
+        "<sip:first.example;lr>\r\n"
+    )
+    assert expected in first_ack
+    assert expected in repeated_ack
+    assert expected in delayed_ack
+    assert expected in bye
+    assert first_ack.startswith("ACK sip:bob@target.example SIP/2.0\r\n")
+    assert bye.startswith("BYE sip:bob@target.example SIP/2.0\r\n")
+    assert media_starts == 1
+    assert state == sip_client.SipState.REGISTERED
+    assert dialog_cseq == 3
+    assert invite_cseq == 2
+
+
+def test_cancel_race_acks_and_ends_late_2xx_with_original_invite_cseq():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client._local_ip = "192.0.2.10"
+        client._local_port = 5060
+        client._outbound = True
+        client._d_call_id = "call@example"
+        client._d_local = "<sip:alice@example>;tag=local"
+        client._d_remote = "<sip:bob@example>"
+        client._d_remote_target = "sip:bob@example"
+        client._d_branch = "z9hG4bKinvite"
+        client._d_cseq = 2
+        client._invite_cseq = 2
+        client.registered = True
+        client.state = sip_client.SipState.RINGING_OUT
+        response = sm.parse_sip_message(
+            "SIP/2.0 200 OK\r\n"
+            "Record-Route: <sip:first.example;lr>,<sip:last.example;lr>\r\n"
+            "To: <sip:bob@example>;tag=late\r\n"
+            "Contact: <sip:bob@late.example>\r\n"
+            "Call-ID: call@example\r\n"
+            "CSeq: 2 INVITE\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with (
+            patch.object(client, "_send_raw") as send,
+            patch.object(client, "_start_media", AsyncMock()) as start_media,
+        ):
+            client.hangup()
+            client._handle_invite_response(response)
+            await asyncio.sleep(0)
+        return client, [call.args[0] for call in send.call_args_list], start_media
+
+    client, sent, start_media = asyncio.run(run())
+    assert len(sent) == 3
+    assert sent[0].startswith("CANCEL sip:bob@example SIP/2.0\r\n")
+    assert "branch=z9hG4bKinvite;rport" in sent[0]
+    assert "CSeq: 2 CANCEL\r\n" in sent[0]
+    assert sent[1].startswith("ACK sip:bob@late.example SIP/2.0\r\n")
+    assert sent[2].startswith("BYE sip:bob@late.example SIP/2.0\r\n")
+    assert client._d_cseq == 2
+    assert client._invite_cseq == 2
+    assert client.state == sip_client.SipState.REGISTERED
+    start_media.assert_not_awaited()
+
+
+def test_invite_response_from_previous_call_id_is_ignored():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client._outbound = True
+        client._d_call_id = "current@example"
+        client._d_cseq = 1
+        client._invite_cseq = 1
+        client.state = sip_client.SipState.RINGING_OUT
+        response = sm.parse_sip_message(
+            "SIP/2.0 200 OK\r\n"
+            "To: <sip:bob@example>;tag=old\r\n"
+            "Contact: <sip:bob@old.example>\r\n"
+            "Call-ID: previous@example\r\n"
+            "CSeq: 1 INVITE\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with (
+            patch.object(client, "_send_raw") as send,
+            patch.object(client, "_start_media", AsyncMock()) as start_media,
+        ):
+            client._handle_invite_response(response)
+        return client, send, start_media
+
+    client, send, start_media = asyncio.run(run())
+    send.assert_not_called()
+    start_media.assert_not_awaited()
+    assert client.state == sip_client.SipState.RINGING_OUT
+
+
+def test_forked_invite_2xx_is_acknowledged_and_ended_without_replacing_dialog():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client._local_ip = "192.0.2.10"
+        client._local_port = 5060
+        client._outbound = True
+        client._d_call_id = "call@example"
+        client._d_local = "<sip:alice@example>;tag=local"
+        client._d_remote = "<sip:bob@example>;tag=accepted"
+        client._d_remote_target = "sip:bob@accepted.example"
+        client._d_cseq = 1
+        client._invite_cseq = 1
+        client._dialog_routes = ["<sip:accepted-proxy.example;lr>"]
+        client._accepted_dialog_to = client._d_remote
+        client.state = sip_client.SipState.IN_CALL
+        response = sm.parse_sip_message(
+            "SIP/2.0 200 OK\r\n"
+            "Record-Route: <sip:first-fork.example;lr>,<sip:last-fork.example;lr>\r\n"
+            "To: <sip:bob@example>;tag=forked\r\n"
+            "Contact: <sip:bob@forked.example>\r\n"
+            "Call-ID: call@example\r\n"
+            "CSeq: 1 INVITE\r\n"
+            "Content-Length: 0\r\n\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_invite_response(response)
+        return client, [call.args[0] for call in send.call_args_list]
+
+    client, sent = asyncio.run(run())
+    assert len(sent) == 2
+    assert sent[0].startswith("ACK sip:bob@forked.example SIP/2.0\r\n")
+    assert sent[1].startswith("BYE sip:bob@forked.example SIP/2.0\r\n")
+    expected = "Route: <sip:last-fork.example;lr>, <sip:first-fork.example;lr>\r\n"
+    assert expected in sent[0]
+    assert expected in sent[1]
+    assert client._d_remote == "<sip:bob@example>;tag=accepted"
+    assert client._d_remote_target == "sip:bob@accepted.example"
+    assert client._dialog_routes == ["<sip:accepted-proxy.example;lr>"]
+
+
+def test_new_outbound_call_clears_previous_dialog_routes():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client.state = sip_client.SipState.REGISTERED
+        client._dialog_routes = ["<sip:stale.example;lr>"]
+        with (
+            patch.object(client, "_send_raw"),
+            patch.object(client, "_start_invite_retx"),
+        ):
+            client.call("1234")
+        return client._dialog_routes, client._d_cseq, client._invite_cseq
+
+    assert asyncio.run(run()) == ([], 1, 1)
+
+
+def test_authenticated_invite_updates_retained_invite_cseq():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(
+            sip_client.SipConfig(
+                server="pbx.example",
+                username="alice",
+                password="secret",
+                domain="example",
+            )
+        )
+        client._local_ip = "192.0.2.10"
+        client._local_port = 5060
+        client._outbound = True
+        client._d_call_id = "call@example"
+        client._d_local = "<sip:alice@example>;tag=local"
+        client._d_remote = "<sip:bob@example>"
+        client._d_remote_target = "sip:bob@example"
+        client._d_branch = "z9hG4bKinitial"
+        client._d_cseq = 1
+        client._invite_cseq = 1
+        client.state = sip_client.SipState.INVITING
+        response = sm.parse_sip_message(
+            "SIP/2.0 407 Proxy Authentication Required\r\n"
+            "To: <sip:bob@example>;tag=proxy\r\n"
+            "Call-ID: call@example\r\n"
+            "CSeq: 1 INVITE\r\n"
+            'Proxy-Authenticate: Digest realm="example", nonce="abc123"\r\n'
+            "Content-Length: 0\r\n\r\n"
+        )
+        with (
+            patch.object(client, "_send_raw") as send,
+            patch.object(client, "_start_invite_retx"),
+        ):
+            client._handle_invite_response(response)
+        return client, [call.args[0] for call in send.call_args_list]
+
+    client, sent = asyncio.run(run())
+    assert client._d_cseq == 2
+    assert client._invite_cseq == 2
+    assert "CSeq: 1 ACK\r\n" in sent[0]
+    assert "CSeq: 2 INVITE\r\n" in sent[1]
+
+
+def test_inbound_dialog_keeps_record_route_wire_order():
+    if sip_client is None:
+        return
+
+    async def run():
+        client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+        client.state = sip_client.SipState.REGISTERED
+        invite = sm.parse_sip_message(
+            "INVITE sip:alice@example SIP/2.0\r\n"
+            "Record-Route: <sip:first.example;lr>,<sip:second.example;lr>\r\n"
+            "From: <sip:bob@example>;tag=remote\r\n"
+            "To: <sip:alice@example>\r\n"
+            "Contact: <sip:bob@target.example>\r\n"
+            "Call-ID: inbound@example\r\n"
+            "CSeq: 1 INVITE\r\n"
+            "Content-Type: application/sdp\r\n\r\n"
+            "v=0\r\nc=IN IP4 198.51.100.10\r\n"
+            "m=audio 4000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n"
+        )
+        with patch.object(client, "_send_raw") as send:
+            client._handle_request(invite)
+            response = client._build_response(invite, 200, "OK", True)
+        return client._build_in_dialog("BYE"), response, send
+
+    bye, response, _send = asyncio.run(run())
+    assert bye.startswith("BYE sip:bob@target.example SIP/2.0\r\n")
+    assert "Route: <sip:first.example;lr>, <sip:second.example;lr>\r\n" in bye
+    assert "Record-Route: <sip:first.example;lr>,<sip:second.example;lr>\r\n" in response
+
+
+def _inbound_client_with_routes(record_route):
+    """Drive an incoming INVITE carrying `record_route` and return the client."""
+    client = sip_client.SipClient(sip_client.SipConfig(server="pbx.example"))
+    client.state = sip_client.SipState.REGISTERED
+    invite = sm.parse_sip_message(
+        "INVITE sip:14@192.168.1.237:59436 SIP/2.0\r\n"
+        f"Record-Route: {record_route}\r\n"
+        "From: <sip:12@example>;tag=remote\r\n"
+        "To: <sip:14@example>\r\n"
+        "Contact: <sip:12@127.0.0.1:5060>\r\n"
+        "Call-ID: inbound@example\r\n"
+        "CSeq: 1 INVITE\r\n"
+        "Content-Type: application/sdp\r\n\r\n"
+        "v=0\r\nc=IN IP4 198.51.100.10\r\n"
+        "m=audio 4000 RTP/AVP 8\r\na=rtpmap:8 PCMA/8000\r\n"
+    )
+    with patch.object(client, "_send_raw"):
+        client._handle_request(invite)
+    return client, invite
+
+
+def test_strict_route_moves_first_hop_into_request_uri():
+    """A route set without ";lr" is a strict router (RFC 3261 §12.2.1.1).
+
+    The 3CX SBC in issue #39 record-routes without ";lr", so sending the BYE
+    to the peer's Contact would address 127.0.0.1 and never reach the SBC.
+    """
+    if sip_client is None:
+        return
+
+    async def run():
+        client, _ = _inbound_client_with_routes(
+            "<sip:3CXSBC@192.168.1.194:5060;user=proxy;tnlid=sbc.c8d9>"
+        )
+        return client._build_in_dialog("BYE")
+
+    bye = asyncio.run(run())
+    assert bye.startswith(
+        "BYE sip:3CXSBC@192.168.1.194:5060;user=proxy;tnlid=sbc.c8d9 SIP/2.0\r\n"
+    )
+    # The unreachable Contact is preserved as the final route, not dropped.
+    assert "Route: <sip:12@127.0.0.1:5060>\r\n" in bye
+
+
+def test_strict_route_keeps_remaining_hops_from_combined_header():
+    """Comma-combined and repeated Record-Route rows must behave identically."""
+    if sip_client is None:
+        return
+
+    async def run():
+        client, _ = _inbound_client_with_routes(
+            "<sip:sbc.example>,<sip:middle.example>"
+        )
+        return client._build_in_dialog("BYE")
+
+    bye = asyncio.run(run())
+    assert bye.startswith("BYE sip:sbc.example SIP/2.0\r\n")
+    assert "Route: <sip:middle.example>, <sip:12@127.0.0.1:5060>\r\n" in bye
+
+
+def test_lr_lookalike_param_is_not_treated_as_loose():
+    if sip_client is None:
+        return
+
+    async def run():
+        client, _ = _inbound_client_with_routes("<sip:sbc.example;lrx=1>")
+        return client._build_in_dialog("BYE")
+
+    bye = asyncio.run(run())
+    assert bye.startswith("BYE sip:sbc.example;lrx=1 SIP/2.0\r\n")
+
+
+def test_ringing_response_establishes_early_dialog():
+    """18x opens an early dialog, so it needs Record-Route and Contact too."""
+    if sip_client is None:
+        return
+
+    async def run():
+        client, invite = _inbound_client_with_routes("<sip:sbc.example;lr>")
+        return (
+            client._build_response(invite, 180, "Ringing", False),
+            client._build_response(invite, 100, "Trying", False),
+        )
+
+    ringing, trying = asyncio.run(run())
+    assert "Record-Route: <sip:sbc.example;lr>\r\n" in ringing
+    assert "Contact: <sip:" in ringing
+    # 100 Trying is not dialog-establishing and must stay bare.
+    assert "Record-Route:" not in trying
+    assert "Contact:" not in trying
 
 
 # ------------------------------------------------------- RFC 2833 RX
@@ -664,6 +1103,7 @@ def _setup_assist_deps():
         ERROR = "error"
 
     class _PipelineStage:
+        INTENT = "intent"
         STT = "stt"
         TTS = "tts"
 
@@ -757,6 +1197,55 @@ def _run_bridge_session(bridge):
     asyncio.run(_wait())
 
 
+def _initial_prompt_doubles(PET, PE, *events):
+    """Return reusable doubles for a text-input Assist pipeline run."""
+    from contextlib import nullcontext
+
+    pipeline_runs = []
+    pipeline_inputs = []
+
+    class FakePipelineRun:
+        def __init__(self, hass, **kwargs):
+            self.hass = hass
+            self.kwargs = kwargs
+            pipeline_runs.append(self)
+
+    class FakePipelineInput:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            pipeline_inputs.append(self)
+
+        async def validate(self):
+            return None
+
+        async def execute(self):
+            callback = self.kwargs["run"].kwargs["event_callback"]
+            callback(
+                PE(
+                    PET.RUN_START,
+                    {"conversation_id": self.kwargs["session"].conversation_id},
+                )
+            )
+            for event_type, data in events:
+                callback(PE(event_type, data))
+
+    fake_chat_session = MagicMock()
+    fake_chat_session.async_get_chat_session.side_effect = (
+        lambda hass, conversation_id: nullcontext(
+            types.SimpleNamespace(
+                conversation_id=conversation_id or "opening-conversation"
+            )
+        )
+    )
+    return (
+        pipeline_runs,
+        pipeline_inputs,
+        FakePipelineRun,
+        FakePipelineInput,
+        fake_chat_session,
+    )
+
+
 def test_assist_listening_gate():
     assist_mod, _, _, _ = _assist_ctx()
     bridge = assist_mod.AssistBridge(
@@ -818,6 +1307,62 @@ def test_assist_silent_turns_end_session():
     assert len(done_calls) == 1
 
 
+def test_assist_hangup_on_end_shrinks_silent_turn_budget():
+    """hangup_on_end ends after 1 silent turn instead of the configured 2.
+
+    Regression for #41: without a smaller budget, hangup_on_end callers wait
+    through the full silent-turn count before the call is torn down.
+    """
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    turn_count = 0
+    done_calls = []
+
+    async def mock_pipeline(hass, **kwargs):
+        nonlocal turn_count
+        turn_count += 1
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=lambda: done_calls.append(1),
+        max_silent_turns=2,
+        hangup_on_end=True,
+    )
+    _run_bridge_session(bridge)
+    assert turn_count == 1
+    assert len(done_calls) == 1
+
+
+def test_assist_hangup_on_end_does_not_widen_a_stricter_budget():
+    """hangup_on_end only ever shrinks the budget, never grows it.
+
+    An explicit max_silent_turns=0 already ends after the first silent turn;
+    hangup_on_end clamping it up to 1 would wait through an extra turn.
+    """
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    turn_count = 0
+
+    async def mock_pipeline(hass, **kwargs):
+        nonlocal turn_count
+        turn_count += 1
+        kwargs["event_callback"](PE(PET.ERROR, {"code": "stt-no-text-recognized"}))
+
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_pipeline
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        max_silent_turns=0,
+        hangup_on_end=True,
+    )
+    _run_bridge_session(bridge)
+    assert turn_count == 1
+
+
 def test_assist_conversation_id_carried_across_turns():
     assist_mod, mock_ap, PET, PE = _assist_ctx()
     conv_ids = []
@@ -839,6 +1384,388 @@ def test_assist_conversation_id_carried_across_turns():
     )
     _run_bridge_session(bridge)
     assert conv_ids[1] == "conv-abc"
+
+
+def test_assist_initial_prompt_error_still_starts_audio_with_context():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    audio_calls = []
+    (
+        pipeline_runs,
+        pipeline_inputs,
+        fake_run,
+        fake_input,
+        fake_chat_session,
+    ) = _initial_prompt_doubles(
+        PET, PE, (PET.ERROR, {"code": "intent-failed"})
+    )
+
+    async def mock_audio_pipeline(hass, **kwargs):
+        audio_calls.append(kwargs)
+
+    mock_ap.async_pipeline_from_audio_stream.reset_mock()
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_audio_pipeline
+
+    with (
+        patch.object(assist_mod, "PipelineRun", fake_run),
+        patch.object(assist_mod, "PipelineInput", fake_input),
+        patch.object(assist_mod, "chat_session", fake_chat_session),
+    ):
+        bridge = assist_mod.AssistBridge(
+            MagicMock(),
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            initial_prompt="Greet the caller",
+            system_prompt="Keep answers concise",
+            max_turns=1,
+        )
+        _run_bridge_session(bridge)
+
+    assert len(pipeline_inputs) == 1
+    assert pipeline_inputs[0].kwargs["intent_input"] == "Greet the caller"
+    assert (
+        pipeline_inputs[0].kwargs["conversation_extra_system_prompt"]
+        == "Keep answers concise"
+    )
+    assert pipeline_runs[0].kwargs["start_stage"] == "intent"
+    assert pipeline_runs[0].kwargs["end_stage"] == "tts"
+    assert len(audio_calls) == 1
+    assert audio_calls[0]["conversation_id"] == "opening-conversation"
+    assert (
+        audio_calls[0]["conversation_extra_system_prompt"]
+        == "Keep answers concise"
+    )
+
+
+def test_assist_system_prompt_does_not_create_opening_turn():
+    assist_mod, mock_ap, _, _ = _assist_ctx()
+    audio_calls = []
+
+    async def mock_audio_pipeline(hass, **kwargs):
+        audio_calls.append(kwargs)
+
+    mock_ap.async_pipeline_from_audio_stream.reset_mock()
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_audio_pipeline
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        system_prompt="Keep answers concise",
+        max_turns=2,
+    )
+    _run_bridge_session(bridge)
+
+    assert len(audio_calls) == 2
+    assert all(
+        call["conversation_extra_system_prompt"] == "Keep answers concise"
+        for call in audio_calls
+    )
+
+
+def test_assist_reuses_supplied_conversation_id_for_audio_turns():
+    assist_mod, mock_ap, _, _ = _assist_ctx()
+    conversation_ids = []
+
+    async def mock_audio_pipeline(hass, **kwargs):
+        conversation_ids.append(kwargs["conversation_id"])
+
+    mock_ap.async_pipeline_from_audio_stream.reset_mock()
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_audio_pipeline
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=MagicMock(),
+        on_done_fn=MagicMock(),
+        conversation_id="existing-conversation",
+        max_turns=2,
+    )
+    _run_bridge_session(bridge)
+
+    assert conversation_ids == ["existing-conversation", "existing-conversation"]
+
+
+def test_assist_initial_prompt_reuses_supplied_conversation_id():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    audio_calls = []
+    _, _, fake_run, fake_input, fake_chat_session = _initial_prompt_doubles(PET, PE)
+
+    async def mock_audio_pipeline(hass, **kwargs):
+        audio_calls.append(kwargs)
+
+    mock_ap.async_pipeline_from_audio_stream.reset_mock()
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_audio_pipeline
+    hass = MagicMock()
+
+    with (
+        patch.object(assist_mod, "PipelineRun", fake_run),
+        patch.object(assist_mod, "PipelineInput", fake_input),
+        patch.object(assist_mod, "chat_session", fake_chat_session),
+    ):
+        bridge = assist_mod.AssistBridge(
+            hass,
+            play_source_fn=MagicMock(),
+            on_done_fn=MagicMock(),
+            conversation_id="existing-conversation",
+            initial_prompt="Continue our conversation",
+            max_turns=1,
+        )
+        _run_bridge_session(bridge)
+
+    fake_chat_session.async_get_chat_session.assert_called_once_with(
+        hass, "existing-conversation"
+    )
+    assert audio_calls[0]["conversation_id"] == "existing-conversation"
+
+
+def test_assist_initial_prompt_waits_for_tts_before_listening():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_get_stream = mock_tts.async_get_stream.return_value
+    audio_calls = []
+    play_source = MagicMock()
+
+    _, _, fake_run, fake_input, fake_chat_session = _initial_prompt_doubles(
+        PET, PE, (PET.TTS_END, {"tts_output": {"token": "opening-tts"}})
+    )
+
+    async def stream_result():
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = stream_result
+    mock_tts.async_get_stream.return_value = stream
+
+    async def mock_audio_pipeline(hass, **kwargs):
+        audio_calls.append(kwargs)
+
+    mock_ap.async_pipeline_from_audio_stream.reset_mock()
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_audio_pipeline
+
+    async def run():
+        with (
+            patch.object(assist_mod, "PipelineRun", fake_run),
+            patch.object(assist_mod, "PipelineInput", fake_input),
+            patch.object(assist_mod, "chat_session", fake_chat_session),
+        ):
+            bridge = assist_mod.AssistBridge(
+                MagicMock(),
+                play_source_fn=play_source,
+                on_done_fn=MagicMock(),
+                initial_prompt="Greet the caller",
+                max_turns=1,
+            )
+            bridge.start()
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if play_source.called:
+                    break
+            assert play_source.called
+            assert audio_calls == []
+            assert bridge.session_task is not None
+            assert not bridge.session_task.done()
+            bridge.on_playback_done()
+            await bridge.session_task
+
+    try:
+        asyncio.run(run())
+    finally:
+        mock_tts.async_get_stream.return_value = original_get_stream
+
+    assert len(audio_calls) == 1
+
+
+def test_assist_initial_prompt_barge_in_becomes_first_turn_preroll():
+    assist_mod, mock_ap, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_get_stream = mock_tts.async_get_stream.return_value
+    original_min = assist_mod._VAD_MIN_SPEECH_FRAMES
+    original_micro_vad = assist_mod.MicroVad
+    preroll_queue_sizes = []
+    play_source = MagicMock()
+    stop_audio = MagicMock()
+
+    _, _, fake_run, fake_input, fake_chat_session = _initial_prompt_doubles(
+        PET, PE, (PET.TTS_END, {"tts_output": {"token": "opening-tts"}})
+    )
+
+    class StubVad:
+        def Process10ms(self, frame: bytes) -> float:
+            return 0.9
+
+    async def stream_result():
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = stream_result
+    mock_tts.async_get_stream.return_value = stream
+
+    async def mock_audio_pipeline(hass, **kwargs):
+        preroll_queue_sizes.append(kwargs["stt_stream"].queue.qsize())
+
+    mock_ap.async_pipeline_from_audio_stream.reset_mock()
+    mock_ap.async_pipeline_from_audio_stream.side_effect = mock_audio_pipeline
+    assist_mod.MicroVad = lambda: StubVad()
+    assist_mod._VAD_MIN_SPEECH_FRAMES = 2
+
+    async def run():
+        with (
+            patch.object(assist_mod, "PipelineRun", fake_run),
+            patch.object(assist_mod, "PipelineInput", fake_input),
+            patch.object(assist_mod, "chat_session", fake_chat_session),
+        ):
+            bridge = assist_mod.AssistBridge(
+                MagicMock(),
+                play_source_fn=play_source,
+                on_done_fn=MagicMock(),
+                initial_prompt="Greet the caller",
+                barge_in=True,
+                stop_audio_fn=stop_audio,
+                max_turns=1,
+            )
+            bridge.start()
+            for _ in range(50):
+                await asyncio.sleep(0.01)
+                if play_source.called:
+                    break
+            assert play_source.called
+            frame = b"\x00\x01" * (assist_mod._VAD_FRAME_BYTES // 2)
+            bridge.write(frame)
+            assert bridge.session_task is not None
+            await bridge.session_task
+
+    try:
+        asyncio.run(run())
+    finally:
+        mock_tts.async_get_stream.return_value = original_get_stream
+        assist_mod._VAD_MIN_SPEECH_FRAMES = original_min
+        assist_mod.MicroVad = original_micro_vad
+
+    stop_audio.assert_called_once_with(flush=True)
+    assert preroll_queue_sizes[0] > 0
+
+
+def test_assist_ignores_prior_playback_done_while_tts_is_pending():
+    assist_mod, _, PET, PE = _assist_ctx()
+    mock_tts = sys.modules["homeassistant.components.tts"]
+    original_get_stream = mock_tts.async_get_stream.return_value
+    media_playing = {"value": True}
+    play_source = MagicMock()
+
+    async def stream_result():
+        yield b"RIFF...."
+
+    stream = MagicMock()
+    stream.async_stream_result = stream_result
+    mock_tts.async_get_stream.return_value = stream
+
+    bridge = assist_mod.AssistBridge(
+        MagicMock(),
+        play_source_fn=play_source,
+        on_done_fn=MagicMock(),
+        media_playing_fn=lambda: media_playing["value"],
+    )
+
+    async def run():
+        bridge._on_pipeline_event(
+            PE(PET.TTS_END, {"tts_output": {"token": "opening-tts"}})
+        )
+        await asyncio.sleep(0.03)
+        assert bridge._background_tasks
+        bridge.on_playback_done()
+        assert not bridge._tx_done.is_set()
+        media_playing["value"] = False
+        for _ in range(50):
+            await asyncio.sleep(0.01)
+            if play_source.called:
+                break
+        assert play_source.called
+        assert bridge._tx_wait == "tts"
+        bridge.on_playback_done()
+        assert bridge._tx_done.is_set()
+        bridge.close()
+        await asyncio.sleep(0)
+
+    try:
+        asyncio.run(run())
+    finally:
+        mock_tts.async_get_stream.return_value = original_get_stream
+
+
+def test_start_assist_service_accepts_and_forwards_prompts():
+    from unittest.mock import AsyncMock
+
+    _assist_ctx()
+    helpers = sys.modules["homeassistant.helpers"]
+    original_cv_attr = helpers.config_validation
+    original_cv_module = sys.modules["homeassistant.helpers.config_validation"]
+    original_service_module = sys.modules.get("homeassistant.helpers.service")
+    cv_stub = types.SimpleNamespace(
+        boolean=bool,
+        match_all=lambda value: value,
+        positive_int=int,
+        string=str,
+        make_entity_service_schema=lambda schema: vol.Schema(schema),
+    )
+    helpers.config_validation = cv_stub
+    sys.modules["homeassistant.helpers.config_validation"] = cv_stub
+    service_stub = types.ModuleType("homeassistant.helpers.service")
+    service_stub.async_extract_config_entry_ids = AsyncMock()
+    sys.modules["homeassistant.helpers.service"] = service_stub
+    try:
+        module_name = f"{_CC_PKG}._integration_init_test"
+        spec = importlib.util.spec_from_file_location(
+            module_name, os.path.join(os.path.abspath(_COMPONENT), "__init__.py")
+        )
+        integration = importlib.util.module_from_spec(spec)
+        sys.modules[module_name] = integration
+        spec.loader.exec_module(integration)
+    finally:
+        helpers.config_validation = original_cv_attr
+        sys.modules["homeassistant.helpers.config_validation"] = original_cv_module
+        if original_service_module is None:
+            sys.modules.pop("homeassistant.helpers.service", None)
+        else:
+            sys.modules["homeassistant.helpers.service"] = original_service_module
+
+    service_data = integration.SERVICE_ASSIST_SCHEMA(
+        {
+            "conversation_id": "existing-conversation",
+            "initial_prompt": "Greet the caller",
+            "system_prompt": "Keep answers concise",
+        }
+    )
+    assert service_data["conversation_id"] == "existing-conversation"
+    assert service_data["initial_prompt"] == "Greet the caller"
+    assert service_data["system_prompt"] == "Keep answers concise"
+
+    trigger_assist = AsyncMock()
+    entry = MagicMock()
+    entry.domain = "sip"
+    entry.state.value = "loaded"
+    entry.runtime_data = {"trigger_assist_fn": trigger_assist}
+
+    hass = MagicMock()
+    hass.services.has_service.return_value = False
+    hass.config_entries.async_entries.return_value = [entry]
+    hass.config_entries.async_get_entry.return_value = entry
+    integration.async_extract_config_entry_ids = AsyncMock(return_value={"entry-1"})
+
+    async def run_service():
+        await integration.async_register_services(hass)
+        registration = next(
+            call
+            for call in hass.services.async_register.call_args_list
+            if call.args[:2] == ("sip", "start_assist")
+        )
+        handler = registration.args[2]
+        await handler(types.SimpleNamespace(data=service_data))
+
+    asyncio.run(run_service())
+    trigger_assist.assert_awaited_once_with(
+        conversation_id="existing-conversation",
+        initial_prompt="Greet the caller",
+        system_prompt="Keep answers concise",
+    )
 
 
 def test_assist_playback_done_unblocks_next_turn():

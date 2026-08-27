@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import enum
 import logging
+import re
 import socket
 import time
 from dataclasses import dataclass
@@ -117,6 +118,17 @@ def _angle_uri(value: str) -> str:
     return stripped if stripped.startswith("sip") else ""
 
 
+# A route is loose only when its URI carries an ";lr" parameter (RFC 3261
+# §19.1.1). Match it as a whole parameter so ";lrx" or a userinfo "lr" is not
+# mistaken for one.
+_LOOSE_ROUTE_PARAM = re.compile(r";lr(?=[;=?]|$)", re.IGNORECASE)
+
+
+def _is_loose_route(route: str) -> bool:
+    """Whether a Record-Route/Route field-value points at a loose router."""
+    return bool(_LOOSE_ROUTE_PARAM.search(_angle_uri(route) or route.strip()))
+
+
 class _SipProtocol(asyncio.DatagramProtocol):
     def __init__(self, on_packet: Callable[[bytes], None]) -> None:
         self._on_packet = on_packet
@@ -163,9 +175,12 @@ class SipClient:
         self._d_local_tag = ""
         self._d_branch = ""
         self._d_cseq = 0
+        self._invite_cseq = 0
         self._outbound = False
         self._invite_auth_tried = False
         self._incoming_invite: sm.SipMessage | None = None
+        self._dialog_routes: list[str] = []
+        self._accepted_dialog_to = ""
 
         # negotiated media
         self._remote_rtp_ip = ""
@@ -496,10 +511,13 @@ class SipClient:
         self._pending_source = on_connect_source
         self._outbound = True
         self._invite_auth_tried = False
+        self._dialog_routes = []
+        self._accepted_dialog_to = ""
         self._d_call_id = sm.gen_call_id(self._local_ip)
         self._d_local_tag = sm.gen_tag()
         self._d_branch = sm.gen_branch()
         self._d_cseq = 1
+        self._invite_cseq = self._d_cseq
         self._invite_number = number
         disp = self.config.caller_id or self.config.username
         self._d_local = (
@@ -598,13 +616,15 @@ class SipClient:
         )
         return msg
 
-    def _build_ack(self, resp: sm.SipMessage) -> str:
+    def _build_ack(
+        self, resp: sm.SipMessage, routes: list[str] | None = None
+    ) -> str:
         to = resp.header("To")
         target = _angle_uri(resp.header("Contact")) or self._d_remote_target
         try:
             cseq = resp.header("CSeq").split()[0]
         except (ValueError, IndexError):
-            cseq = str(self._d_cseq)
+            cseq = str(self._invite_cseq)
             
         if 300 <= resp.status_code < 700:
             # ACK to a non-2xx response MUST use the exact same branch as the original request
@@ -614,16 +634,19 @@ class SipClient:
             branch = sm.gen_branch()
             
         via = f"SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={branch};rport"
-            
+
+        if self._service_routes and 300 <= resp.status_code < 700:
+            route_block = f"Route: {self._service_routes}\r\n"
+        elif 200 <= resp.status_code < 300:
+            target, route_block = self._route_request(target, routes)
+        else:
+            route_block = ""
+
         msg = (
             f"ACK {target} SIP/2.0\r\n"
             f"Via: {via}\r\n"
             "Max-Forwards: 70\r\n"
-        )
-        if self._service_routes and 300 <= resp.status_code < 700:
-            msg += f"Route: {self._service_routes}\r\n"
-
-        msg += (
+            f"{route_block}"
             f"From: {self._d_local}\r\n"
             f"To: {to or self._d_remote}\r\n"
             f"Call-ID: {self._d_call_id}\r\n"
@@ -636,12 +659,20 @@ class SipClient:
         if not self._outbound:
             return
 
+        cseq_parts = m.header("CSeq").split()
         try:
-            cseq_num = int(m.header("CSeq").split()[0])
+            cseq_num = int(cseq_parts[0])
         except (ValueError, IndexError):
             cseq_num = 0
 
-        if cseq_num != self._d_cseq:
+        if (
+            len(cseq_parts) < 2
+            or cseq_parts[1].upper() != "INVITE"
+            or m.header("Call-ID") != self._d_call_id
+        ):
+            return
+
+        if cseq_num != self._invite_cseq:
             # Ignore responses for old transactions, but re-ACK final failures (>=300)
             # to stop server retransmissions.
             if 300 <= m.status_code < 700:
@@ -669,6 +700,7 @@ class SipClient:
                 nonce, "auth" if qop else "", nc, cnonce,
             )
             self._d_cseq += 1
+            self._invite_cseq = self._d_cseq
             self._d_branch = sm.gen_branch()
             msg = self._build_invite()
             auth = self._digest_auth_line(
@@ -685,19 +717,34 @@ class SipClient:
             return
 
         if 200 <= m.status_code < 300:
-            # Retransmitted 2xx (our ACK was lost): re-ACK only, no duplicate setup.
-            if self.state == SipState.IN_CALL:
-                self._send_raw(self._build_ack(m))
+            response_routes = list(
+                reversed(sm.split_header_values(m.header("Record-Route")))
+            )
+            response_to = m.header("To") or self._d_remote
+
+            # Every 2xx requires an ACK. A retransmission of the accepted
+            # dialog must not repeat media setup, even if the call has ended.
+            if self._accepted_dialog_to:
+                if response_to == self._accepted_dialog_to:
+                    self._send_raw(self._build_ack(m, response_routes))
+                else:
+                    self._end_forked_dialog(m, response_routes, response_to)
+                return
+
+            # A 2xx can race with local cancellation. Acknowledge and close
+            # the unwanted dialog without reviving the call.
+            if self.state not in (SipState.INVITING, SipState.RINGING_OUT):
+                self._end_forked_dialog(m, response_routes, response_to)
                 return
             if self._ring_timeout_handle is not None:
                 self._ring_timeout_handle.cancel()
                 self._ring_timeout_handle = None
-            to = m.header("To")
-            if to:
-                self._d_remote = to
+            self._accepted_dialog_to = response_to
+            self._d_remote = response_to
             contact_uri = _angle_uri(m.header("Contact"))
             if contact_uri:
                 self._d_remote_target = contact_uri
+            self._dialog_routes = response_routes
             self._apply_remote_sdp(sm.parse_sdp(m.body))
             self._send_raw(self._build_ack(m))
 
@@ -775,7 +822,13 @@ class SipClient:
             f"Call-ID: {req.header('Call-ID')}\r\n"
             f"CSeq: {req.header('CSeq')}\r\n"
         )
-        if 200 <= code < 300 and req.method == "INVITE":
+        # RFC 3261 §12.1.1: every dialog-establishing response — the early
+        # dialog of a 18x included, not just the 2xx — must echo the request's
+        # Record-Route and carry a Contact the peer can route in-dialog
+        # requests to. Dropping either strands a proxy/SBC outside the dialog.
+        if req.method == "INVITE" and 101 <= code < 300:
+            if record_route := req.header("Record-Route"):
+                msg += f"Record-Route: {record_route}\r\n"
             msg += f"Contact: {self._contact_uri()}\r\n"
         msg += f"User-Agent: {USER_AGENT}\r\n"
         if with_sdp:
@@ -821,6 +874,7 @@ class SipClient:
                 self._d_local += f";tag={self._d_local_tag}"
             self._d_remote = m.header("From")
             self._d_remote_target = _angle_uri(m.header("Contact"))
+            self._dialog_routes = sm.split_header_values(m.header("Record-Route"))
             try:
                 self._d_cseq = int(m.header("CSeq").split()[0])
             except (ValueError, IndexError):
@@ -919,7 +973,6 @@ class SipClient:
             self._send_raw(self._build_in_dialog("BYE"))
             self._end_call()
         elif self.state in (SipState.INVITING, SipState.RINGING_OUT):
-            self._d_cseq += 1
             msg = (
                 f"CANCEL {self._d_remote_target} SIP/2.0\r\n"
                 f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={self._d_branch};rport\r\n"
@@ -927,7 +980,7 @@ class SipClient:
                 f"From: {self._d_local}\r\n"
                 f"To: {self._d_remote}\r\n"
                 f"Call-ID: {self._d_call_id}\r\n"
-                f"CSeq: {self._d_cseq} CANCEL\r\n"
+                f"CSeq: {self._invite_cseq} CANCEL\r\n"
                 "Content-Length: 0\r\n\r\n"
             )
             self._send_raw(msg)
@@ -946,17 +999,66 @@ class SipClient:
             self._send_raw(self._build_response(self._incoming_invite, code, reason, False))
             self._end_call()
 
-    def _build_in_dialog(self, method: str) -> str:
+    def _build_in_dialog(
+        self,
+        method: str,
+        *,
+        target: str | None = None,
+        remote: str | None = None,
+        routes: list[str] | None = None,
+        cseq: int | None = None,
+    ) -> str:
+        request_uri, route_block = self._route_request(
+            target or self._d_remote_target, routes
+        )
         return (
-            f"{method} {self._d_remote_target} SIP/2.0\r\n"
+            f"{method} {request_uri} SIP/2.0\r\n"
             f"Via: SIP/2.0/UDP {self._local_ip}:{self._local_port};branch={sm.gen_branch()};rport\r\n"
             "Max-Forwards: 70\r\n"
+            f"{route_block}"
             f"From: {self._d_local}\r\n"
-            f"To: {self._d_remote}\r\n"
+            f"To: {remote or self._d_remote}\r\n"
             f"Call-ID: {self._d_call_id}\r\n"
-            f"CSeq: {self._d_cseq} {method}\r\n"
+            f"CSeq: {cseq if cseq is not None else self._d_cseq} {method}\r\n"
             f"User-Agent: {USER_AGENT}\r\n"
             "Content-Length: 0\r\n\r\n"
+        )
+
+    def _route_request(
+        self, target: str, routes: list[str] | None = None
+    ) -> tuple[str, str]:
+        """Resolve the Request-URI and Route block for an in-dialog request.
+
+        RFC 3261 §12.2.1.1: when the first hop is a loose router the remote
+        target stays in the Request-URI and the whole route set travels as
+        Route headers. A strict router instead takes the Request-URI, and the
+        remote target moves to the tail of the route set so it is not lost.
+        """
+        active = [r for r in (self._dialog_routes if routes is None else routes) if r.strip()]
+        if not active:
+            return target, ""
+        if _is_loose_route(active[0]):
+            return target, f"Route: {', '.join(active)}\r\n"
+        remaining = active[1:]
+        if target:
+            remaining = [*remaining, f"<{target}>"]
+        route_block = f"Route: {', '.join(remaining)}\r\n" if remaining else ""
+        return _angle_uri(active[0]) or active[0], route_block
+
+    def _end_forked_dialog(
+        self, response: sm.SipMessage, routes: list[str], remote: str
+    ) -> None:
+        """Acknowledge and close an unwanted 2xx dialog without changing state."""
+        target = _angle_uri(response.header("Contact")) or self._d_remote_target
+        self._send_raw(self._build_ack(response, routes))
+        self._send_raw(
+            self._build_in_dialog(
+                "BYE",
+                target=target,
+                remote=remote,
+                routes=routes,
+                cseq=self._d_cseq + 1,
+            )
         )
 
     def send_dtmf(self, digits: str) -> None:
