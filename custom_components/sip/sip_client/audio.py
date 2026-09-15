@@ -6,17 +6,22 @@ This is the extension seam. The SIP/RTP core only knows about two PCM ports:
 * :class:`AudioSink` receives RX audio from ``RtpSession.on_audio``.
 
 Today's implementations cover "play a file / TTS to the far end" (TX) and
-"discard / record" (RX). A microphone source or a media_player sink can be added
-later by implementing the same tiny interfaces, without touching the SIP core.
+"discard / record / tee to several listeners" (RX). A microphone source or a
+media_player sink can be added later by implementing the same tiny interfaces,
+without touching the SIP core.
 """
 from __future__ import annotations
 
 import asyncio
 import logging
 import math
+import os
+import queue
 import struct
+import threading
 import wave
 from abc import ABC, abstractmethod
+from collections.abc import AsyncIterable
 from typing import Callable
 
 _LOGGER = logging.getLogger(__name__)
@@ -28,6 +33,15 @@ ActiveFn = Callable[[], bool]
 # one second and drops from the *front* when it overflows, so staying well
 # under that turns event-loop jitter into slack instead of dropped audio.
 _PCM_PREBUFFER_SEC = 0.5
+# How far behind real time is still treated as catch-up rather than a stall
+# that needs a clock resync. Paired with the prebuffer this is the most PCM
+# a source may dump in one burst (0.5 + 0.5 = 1.0 s), matching the TX cap.
+_PCM_MAX_BEHIND_SEC = _PCM_PREBUFFER_SEC
+_FFMPEG_STDERR_LIMIT = 8192
+# After ffmpeg closes stdout it should exit on its own almost immediately.
+# Wait this long for a meaningful exit status before killing a straggler
+# (e.g. one blocked on stdin or a hung filter).
+_FFMPEG_EXIT_TIMEOUT_SEC = 2.0
 
 
 def default_pcm_frame_bytes(sample_rate: int) -> int:
@@ -58,11 +72,19 @@ class _RealtimePacer:
 
     async def wait(self) -> None:
         ahead = self._queued_sec - (self._loop.time() - self._start)
+        if ahead < -_PCM_MAX_BEHIND_SEC:
+            # Streaming TTS (and a long loop freeze) can stall ffmpeg stdout
+            # for well over a second, then dump a blob. Unlimited catch-up
+            # would overflow RtpSession's 1 s TX buffer and clip speech.
+            # Slide the deadline so the next burst fills at most
+            # prebuffer+behind = 1.0 s; the rest is paced.
+            self._start = self._loop.time() - self._queued_sec - _PCM_MAX_BEHIND_SEC
+            ahead = -_PCM_MAX_BEHIND_SEC
         if ahead > _PCM_PREBUFFER_SEC:
             await asyncio.sleep(ahead - _PCM_PREBUFFER_SEC)
         else:
-            # Inside the prebuffer window (or behind it): yield without
-            # stalling so a delayed loop can catch back up to real time.
+            # Inside the prebuffer window (or a little behind it): yield
+            # without stalling so ordinary jitter can catch back up.
             await asyncio.sleep(0)
 
 
@@ -98,23 +120,132 @@ class NullSink(AudioSink):
         self.bytes_received += len(pcm_le)
 
 
-class WavRecorderSink(AudioSink):
-    """Records received audio to a WAV file (handy for verifying the RX path)."""
+class TeeSink(AudioSink):
+    """Fan-out PCM to registered sinks; one failure does not stop the others."""
 
-    def __init__(self, path: str, sample_rate: int = 8000) -> None:
-        self._wav = wave.open(path, "wb")
-        self._wav.setnchannels(1)
-        self._wav.setsampwidth(2)
-        self._wav.setframerate(sample_rate)
+    def __init__(self, *sinks: AudioSink) -> None:
+        self._sinks: list[AudioSink] = []
+        for sink in sinks:
+            self.add(sink)
+
+    def add(self, sink: AudioSink) -> None:
+        if sink is self or sink in self._sinks:
+            return
+        self._sinks.append(sink)
+
+    def remove(self, sink: AudioSink) -> None:
+        try:
+            self._sinks.remove(sink)
+        except ValueError:
+            pass
+
+    def clear(self) -> None:
+        self._sinks.clear()
+
+    @property
+    def sinks(self) -> tuple[AudioSink, ...]:
+        return tuple(self._sinks)
 
     def write(self, pcm_le: bytes) -> None:
-        self._wav.writeframes(pcm_le)
+        for sink in list(self._sinks):
+            try:
+                sink.write(pcm_le)
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Audio sink error")
 
     def close(self) -> None:
+        for sink in list(self._sinks):
+            try:
+                sink.close()
+            except Exception:  # noqa: BLE001
+                _LOGGER.exception("Audio sink close error")
+
+
+# ~5 s of 20 ms frames. Bound so a stalled disk cannot grow unbounded.
+_WAV_QUEUE_MAX_FRAMES = 250
+
+
+class WavRecorderSink(AudioSink):
+    """Records received audio to a WAV file without blocking the RTP callback.
+
+    ``write`` only enqueues PCM. A worker thread opens the file, writes
+    frames, and closes the WAV so the event loop never waits on disk I/O.
+    """
+
+    def __init__(
+        self,
+        path: str,
+        sample_rate: int = 8000,
+        *,
+        max_queued_frames: int = _WAV_QUEUE_MAX_FRAMES,
+    ) -> None:
+        self.path = path
+        self._sample_rate = sample_rate
+        self._queue: queue.Queue[bytes] = queue.Queue(maxsize=max_queued_frames)
+        self._stop = threading.Event()
+        self._done = threading.Event()
+        self._closed = False
+        self._dropped = False
+        self._thread = threading.Thread(
+            target=self._run, name="sip-wav-recorder", daemon=True
+        )
+        self._thread.start()
+
+    def write(self, pcm_le: bytes) -> None:
+        if self._closed or not pcm_le:
+            return
         try:
-            self._wav.close()
+            self._queue.put_nowait(pcm_le)
+        except queue.Full:
+            if not self._dropped:
+                self._dropped = True
+                _LOGGER.warning(
+                    "Recording queue full; dropping incoming PCM (%s)", self.path
+                )
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        self._stop.set()
+
+    async def wait_closed(self) -> None:
+        """Wait until queued PCM is flushed and the WAV header is finalized."""
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + 10.0
+        while not self._done.is_set():
+            if loop.time() >= deadline:
+                _LOGGER.warning("Timed out waiting for WAV flush (%s)", self.path)
+                return
+            await asyncio.sleep(0.02)
+
+    def _run(self) -> None:
+        wav = None
+        try:
+            parent = os.path.dirname(self.path)
+            if parent:
+                os.makedirs(parent, exist_ok=True)
+            wav = wave.open(self.path, "wb")
+            wav.setnchannels(1)
+            wav.setsampwidth(2)
+            wav.setframerate(self._sample_rate)
+            while True:
+                try:
+                    chunk = self._queue.get(timeout=0.05)
+                except queue.Empty:
+                    if self._stop.is_set():
+                        break
+                    continue
+                wav.writeframes(chunk)
         except Exception:  # noqa: BLE001
-            pass
+            _LOGGER.exception("WAV recorder failed (%s)", self.path)
+        finally:
+            if wav is not None:
+                try:
+                    wav.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._done.set()
 
 
 class _ConfiguredPcmSource(AudioSource):
@@ -162,6 +293,10 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
 
     ``sample_rate`` / ``pcm_frame_bytes`` default to G.711 (8 kHz / 320 B). Call
     :meth:`configure` after negotiation when a different rate is active.
+
+    Provide exactly one of ``url``, ``data``, or ``chunks``. ``chunks`` is the
+    streaming-stdin mode: bytes are written to ffmpeg as they arrive so the
+    first PCM can leave before the producer has finished.
     """
 
     def __init__(
@@ -170,18 +305,22 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
         *,
         url: str | None = None,
         data: bytes | None = None,
+        chunks: AsyncIterable[bytes] | None = None,
         sample_rate: int = 8000,
         pcm_frame_bytes: int | None = None,
     ) -> None:
         super().__init__(sample_rate=sample_rate, pcm_frame_bytes=pcm_frame_bytes)
-        if (url is None) == (data is None):
-            raise ValueError("Provide exactly one of url/data")
+        provided = sum(v is not None for v in (url, data, chunks))
+        if provided != 1:
+            raise ValueError("Provide exactly one of url/data/chunks")
         self._bin = ffmpeg_bin
         self._url = url
         self._data = data
+        self._chunks = chunks
 
     async def run(self, push: PushFn, is_active: ActiveFn) -> None:
         src = self._url if self._url is not None else "pipe:0"
+        use_stdin = self._data is not None or self._chunks is not None
         proc = await asyncio.create_subprocess_exec(
             self._bin,
             "-hide_banner",
@@ -196,13 +335,21 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
             "-f",
             "s16le",
             "pipe:1",
-            stdin=asyncio.subprocess.PIPE if self._data is not None else None,
+            stdin=asyncio.subprocess.PIPE if use_stdin else None,
             stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE,
         )
         assert proc.stdout is not None
+        assert proc.stderr is not None
+        feeder: asyncio.Task | None = None
+        stderr_task = asyncio.create_task(self._read_stderr(proc.stderr))
+        reached_eof = False
+        pcm_bytes = 0
+        stderr = b""
         try:
-            if self._data is not None and proc.stdin is not None:
+            if self._chunks is not None and proc.stdin is not None:
+                feeder = asyncio.create_task(self._feed_stdin(proc.stdin))
+            elif self._data is not None and proc.stdin is not None:
                 proc.stdin.write(self._data)
                 proc.stdin.write_eof()
 
@@ -214,24 +361,86 @@ class FfmpegAudioSource(_ConfiguredPcmSource):
             while is_active():
                 chunk = await proc.stdout.read(frame)
                 if not chunk:
+                    reached_eof = True
                     break
                 # ``read`` returns *up to* ``frame`` bytes. Emit whole frames
                 # only, so a short read does not cost a full frame of pacing.
                 buf.extend(chunk)
                 while len(buf) >= frame:
                     push(bytes(buf[:frame]))
+                    pcm_bytes += frame
                     del buf[:frame]
                     pacer.account(frame)
                     await pacer.wait()
             if buf and is_active():
                 push(bytes(buf))
+                pcm_bytes += len(buf)
         finally:
+            if feeder is not None:
+                feeder.cancel()
+                try:
+                    await feeder
+                except asyncio.CancelledError:
+                    pass
+            if proc.returncode is None and reached_eof:
+                # stdout closed: let ffmpeg finish so its exit status is real.
+                try:
+                    await asyncio.wait_for(proc.wait(), _FFMPEG_EXIT_TIMEOUT_SEC)
+                except TimeoutError:
+                    pass
             if proc.returncode is None:
                 try:
                     proc.kill()
                 except ProcessLookupError:
                     pass
-            await proc.wait()
+            try:
+                await proc.wait()
+                stderr = await stderr_task
+            finally:
+                if not stderr_task.done():
+                    stderr_task.cancel()
+
+        if not reached_eof:
+            # The caller stopped playback (hangup, stop_audio, codec change).
+            # We killed ffmpeg ourselves, so its exit status means nothing.
+            return
+        detail = stderr.decode(errors="replace").strip()
+        suffix = f": {detail}" if detail else ""
+        if proc.returncode:
+            raise RuntimeError(f"ffmpeg exited with status {proc.returncode}{suffix}")
+        if pcm_bytes == 0:
+            raise RuntimeError(f"ffmpeg produced no audio{suffix}")
+
+    @staticmethod
+    async def _read_stderr(stderr: asyncio.StreamReader) -> bytes:
+        """Drain stderr while retaining only a bounded diagnostic tail."""
+        tail = bytearray()
+        while chunk := await stderr.read(4096):
+            tail.extend(chunk)
+            if len(tail) > _FFMPEG_STDERR_LIMIT:
+                del tail[: len(tail) - _FFMPEG_STDERR_LIMIT]
+        return bytes(tail)
+
+    async def _feed_stdin(self, stdin: asyncio.StreamWriter) -> None:
+        """Write streaming chunks to ffmpeg; close stdin when the producer ends."""
+        chunks = self._chunks
+        assert chunks is not None
+        try:
+            async for chunk in chunks:
+                if not chunk:
+                    continue
+                stdin.write(chunk)
+                await stdin.drain()
+            stdin.write_eof()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        finally:
+            aclose = getattr(chunks, "aclose", None)
+            if callable(aclose):
+                try:
+                    await aclose()
+                except Exception:  # noqa: BLE001
+                    pass
 
 
 _TONE_PCM_CACHE: dict[tuple[int, int, int, float, int], bytes] = {}

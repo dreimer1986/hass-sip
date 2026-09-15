@@ -9,15 +9,31 @@ from typing import Any
 
 import voluptuous as vol
 
+from homeassistant.auth.permissions.const import CAT_ENTITIES, POLICY_CONTROL
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import EVENT_HOMEASSISTANT_STOP, Platform
 from homeassistant.core import HomeAssistant, ServiceCall, callback
+from homeassistant.exceptions import (
+    ServiceValidationError,
+    Unauthorized,
+    UnknownUser,
+)
 from homeassistant.helpers import config_validation as cv
 from homeassistant.helpers import device_registry as dr
+from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers import issue_registry as ir
 from homeassistant.helpers.dispatcher import async_dispatcher_send
+from homeassistant.helpers.event import async_track_time_interval
 from homeassistant.helpers.service import async_extract_config_entry_ids
 
 from .assist import AssistBridge
+from .assist_gate import (
+    REASON_NOT_ALLOWED,
+    PinCollector,
+    caller_is_allowed,
+    take_pin_digit,
+)
+from .assist_user import ensure_assist_user, remove_assist_user
 from .const import (
     CONF_CALLER_ID,
     CONF_DOMAIN,
@@ -29,7 +45,12 @@ from .const import (
     CONF_USERNAME,
     CONF_OUTBOUND_PROXY,
     CONF_AUTH_USERNAME,
+    CONF_MEDIA_TIMEOUT,
+    CONF_MAX_CALL_DURATION,
+    DEFAULT_MEDIA_TIMEOUT,
+    DEFAULT_MAX_CALL_DURATION,
     DOMAIN,
+    EVENT_SIP_ASSIST_REJECTED,
     EVENT_SIP_CALL_CONNECTED,
     EVENT_SIP_CALL_ENDED,
     EVENT_SIP_DTMF_DIGIT,
@@ -42,9 +63,54 @@ from .const import (
     LOGGER,
 )
 from .helpers import get_ffmpeg_bin
-from .ivr import IvrSession
-from .sip_client.audio import FfmpegAudioSource, NullSink
+from .ivr import ASSIST_OPTION_FIELDS, IvrSession
+from .recording import (
+    close_recorder_slot,
+    is_allowed_recording_path,
+    recording_allow_roots,
+    resolve_recording_path,
+)
+from .repairs import (
+    is_register_auth_failure,
+    register_auth_issue_id,
+    should_open_auth_repair,
+)
+from .sip_client.audio import FfmpegAudioSource
 from .sip_client.sip_client import SipCallbacks, SipClient, SipConfig, SipState
+
+
+def _recording_roots(hass: HomeAssistant) -> list[str]:
+    extra = list(hass.config.allowlist_external_dirs)
+    extra.extend(hass.config.media_dirs.values())
+    return recording_allow_roots(hass.config.path(), extra)
+
+
+def _fire_recording_stopped(hass: HomeAssistant, entry_id: str, data: dict) -> None:
+    stop_data = {"sip_account": data["config"].username}
+    device_id = _sip_device_id(hass, entry_id)
+    if device_id:
+        stop_data["device_id"] = device_id
+    hass.bus.async_fire(EVENT_SIP_RECORDING_STOPPED, stop_data)
+    async_dispatcher_send(
+        hass,
+        f"{DOMAIN}_event_{entry_id}",
+        EVENT_SIP_RECORDING_STOPPED,
+        None,
+    )
+
+
+def _fire_assist_rejected(
+    hass: HomeAssistant, entry_id: str, data: dict, caller: str, reason: str
+) -> None:
+    extra = {"caller": caller, "reason": reason}
+    payload = {"sip_account": data["config"].username, **extra}
+    device_id = _sip_device_id(hass, entry_id)
+    if device_id:
+        payload["device_id"] = device_id
+    hass.bus.async_fire(EVENT_SIP_ASSIST_REJECTED, payload)
+    async_dispatcher_send(
+        hass, f"{DOMAIN}_event_{entry_id}", EVENT_SIP_ASSIST_REJECTED, extra
+    )
 
 
 def _sip_device_id(hass: HomeAssistant, entry_id: str) -> str | None:
@@ -64,21 +130,33 @@ PLATFORMS = [
     Platform.BUTTON,
 ]
 
+CONTACT_REFRESH_INTERVAL = datetime.timedelta(seconds=5)
 
-def load_contacts(hass: HomeAssistant) -> dict[str, Any]:
-    """Load contacts from the JSON file."""
+
+def load_contacts(hass: HomeAssistant) -> dict[str, Any] | None:
+    """Load contacts from the JSON file.
+
+    Returns ``{}`` when the file does not exist and ``None`` when it exists
+    but cannot be read or is not a JSON object (e.g. a half-written save),
+    so callers can keep the previous cache instead of wiping it.
+    """
     import json
     import os
 
     config_dir = hass.config.path()
     contacts_file = os.path.join(config_dir, "sip_contacts.json")
-    if os.path.exists(contacts_file):
-        try:
-            with open(contacts_file, encoding="utf-8") as f:
-                return json.load(f)
-        except Exception:
-            pass
-    return {}
+    if not os.path.exists(contacts_file):
+        return {}
+    try:
+        with open(contacts_file, encoding="utf-8") as f:
+            data = json.load(f)
+    except Exception as err:  # noqa: BLE001
+        LOGGER.debug("Could not read %s: %s", contacts_file, err)
+        return None
+    if not isinstance(data, dict):
+        LOGGER.debug("%s is not a JSON object", contacts_file)
+        return None
+    return data
 
 
 def get_contact_info_from_cache(
@@ -91,6 +169,29 @@ def get_contact_info_from_cache(
     elif isinstance(info, str):
         return info, False
     return number, False
+
+
+async def async_refresh_contacts(
+    hass: HomeAssistant, runtime_data: dict[str, Any]
+) -> None:
+    """Reload contacts outside the event loop and replace the shared cache.
+
+    A file that is momentarily unreadable (an editor mid-save, invalid JSON)
+    leaves the last good cache in place; only a deleted file empties it.
+    """
+    contacts = await hass.async_add_executor_job(load_contacts, hass)
+    if contacts is None:
+        # Warn once per outage; the periodic refresh would otherwise repeat
+        # this every few seconds until the file is fixed.
+        if not runtime_data.get("contacts_stale"):
+            LOGGER.warning(
+                "sip_contacts.json could not be parsed; keeping the previous contacts"
+            )
+            runtime_data["contacts_stale"] = True
+        return
+    if runtime_data.pop("contacts_stale", False):
+        LOGGER.info("sip_contacts.json loaded again")
+    runtime_data["contacts"] = contacts
 
 
 # Service Schemas
@@ -138,21 +239,12 @@ SERVICE_GENERIC_SCHEMA = cv.make_entity_service_schema({})
 
 SERVICE_ASSIST_SCHEMA = cv.make_entity_service_schema(
     {
-        vol.Optional("pipeline_id"): cv.string,
-        vol.Optional("conversation_id"): cv.string,
-        vol.Optional("initial_prompt"): cv.string,
-        vol.Optional("system_prompt"): cv.string,
-        vol.Optional("max_turns"): vol.All(vol.Coerce(int), vol.Range(min=0)),
-        vol.Optional("max_silent_turns"): vol.All(vol.Coerce(int), vol.Range(min=1)),
-        vol.Optional("barge_in"): cv.boolean,
-        vol.Optional("silence_seconds"): vol.All(
-            vol.Coerce(float), vol.Range(min=0.3, max=5.0)
-        ),
-        vol.Optional("noise_suppression"): vol.All(
-            vol.Coerce(int), vol.Range(min=0, max=4)
-        ),
-        vol.Optional("turn_tone"): cv.boolean,
-        vol.Optional("hangup_on_end"): cv.boolean,
+        # Tuning options live in ivr.py so the IVR ``assist:`` mapping is
+        # validated with exactly the same rules.
+        **ASSIST_OPTION_FIELDS,
+        vol.Optional("allowed_callers"): vol.All(cv.ensure_list, [cv.string]),
+        vol.Optional("contacts_only"): cv.boolean,
+        vol.Optional("pin"): cv.string,
     }
 )
 
@@ -171,10 +263,16 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         outbound_proxy=config.get(CONF_OUTBOUND_PROXY, ""),
         register_expiration=config.get(CONF_REGISTER_EXPIRATION, 300),
         local_rtp_port=config.get(CONF_LOCAL_RTP_PORT, 7078),
+        media_timeout=config.get(CONF_MEDIA_TIMEOUT, DEFAULT_MEDIA_TIMEOUT),
+        max_call_duration=config.get(CONF_MAX_CALL_DURATION, DEFAULT_MAX_CALL_DURATION),
     )
 
     # Load contacts asynchronously from file to avoid blocking event loop on startup
     contacts = await hass.async_add_executor_job(load_contacts, hass)
+    if contacts is None:
+        LOGGER.warning("sip_contacts.json could not be parsed; starting without contacts")
+        contacts = {}
+    assist_user_id = await ensure_assist_user(hass, entry)
 
     entry.runtime_data = {
         "client": None,
@@ -187,9 +285,19 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         "call_connect_time": None,
         "call_direction": None,
         "call_status": "missed",
+        "last_register_failed": None,
+        "last_registered_at": None,
         "contacts": contacts,
         "call_number": "",
+        "pin_collector": None,
     }
+
+    async def refresh_contacts(_now=None) -> None:
+        await async_refresh_contacts(hass, entry.runtime_data)
+
+    entry.async_on_unload(
+        async_track_time_interval(hass, refresh_contacts, CONTACT_REFRESH_INTERVAL)
+    )
 
     # Active session state helpers
     ivr_session: IvrSession | None = None
@@ -226,19 +334,40 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     def on_registered() -> None:
         LOGGER.info("[%s] SIP Client successfully registered", sip_config.username)
         entry.runtime_data["registered"] = True
+        entry.runtime_data["last_register_failed"] = None
+        entry.runtime_data["last_registered_at"] = time.time()
+        ir.async_delete_issue(
+            hass, DOMAIN, register_auth_issue_id(entry.entry_id)
+        )
         async_dispatcher_send(hass, f"{DOMAIN}_state_update_{entry.entry_id}")
         fire_sip_event(EVENT_SIP_REGISTERED)
 
     @callback
+    def on_register_failed(reason: str) -> None:
+        LOGGER.warning("[%s] SIP registration failed: %s", sip_config.username, reason)
+        entry.runtime_data["registered"] = False
+        entry.runtime_data["last_register_failed"] = reason
+        if is_register_auth_failure(reason) and should_open_auth_repair(
+            client.register_auth_failures
+        ):
+            ir.async_create_issue(
+                hass,
+                DOMAIN,
+                register_auth_issue_id(entry.entry_id),
+                is_fixable=False,
+                severity=ir.IssueSeverity.ERROR,
+                translation_key="register_auth_failed",
+                translation_placeholders={
+                    "username": sip_config.username,
+                    "server": sip_config.server,
+                    "reason": reason,
+                },
+            )
+        async_dispatcher_send(hass, f"{DOMAIN}_state_update_{entry.entry_id}")
+
+    @callback
     def on_incoming_call(caller: str) -> None:
         LOGGER.info("[%s] Incoming call from %s", sip_config.username, caller)
-
-        # Reload contacts in background so any manual edits are picked up dynamically
-        def reload_contacts_bg():
-            contacts_data = load_contacts(hass)
-            entry.runtime_data["contacts"] = contacts_data
-
-        hass.async_add_executor_job(reload_contacts_bg)
 
         caller_name, auto_answer = get_contact_info_from_cache(
             entry.runtime_data.get("contacts", {}), caller
@@ -275,8 +404,12 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             hass.async_create_task(ivr_session.start())
 
     @callback
-    def on_call_ended() -> None:
-        LOGGER.info("[%s] Call ended", sip_config.username)
+    def on_call_ended(reason: str = "local") -> None:
+        LOGGER.info("[%s] Call ended (%s)", sip_config.username, reason)
+        collector = entry.runtime_data.get("pin_collector")
+        if collector is not None:
+            collector.fail()
+            entry.runtime_data["pin_collector"] = None
 
         # Save to call history log
         start_time = entry.runtime_data.get("call_start_time")
@@ -302,6 +435,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
                 "direction": direction,
                 "duration": duration,
                 "status": status,
+                "reason": reason,
             }
 
             history = entry.runtime_data.setdefault("call_history", [])
@@ -316,7 +450,7 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             entry.runtime_data["call_status"] = "missed"
             entry.runtime_data["call_number"] = ""
 
-        fire_sip_event(EVENT_SIP_CALL_ENDED)
+        fire_sip_event(EVENT_SIP_CALL_ENDED, {"reason": reason})
         nonlocal ivr_session, assist_bridge
         if ivr_session is not None:
             ivr_session.close()
@@ -324,11 +458,23 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if assist_bridge is not None:
             assist_bridge.close()
             assist_bridge = None
-            client.set_sink(NullSink())
+        recorder = close_recorder_slot(entry.runtime_data)
+        client.clear_sinks()
+        if recorder is not None:
+            entry_id = entry.entry_id
+
+            async def _finish_recording() -> None:
+                await recorder.wait_closed()
+                _fire_recording_stopped(hass, entry_id, entry.runtime_data)
+
+            hass.async_create_task(_finish_recording())
         async_dispatcher_send(hass, f"{DOMAIN}_state_update_{entry.entry_id}")
 
     @callback
     def on_dtmf(digit: str) -> None:
+        collector = entry.runtime_data.get("pin_collector")
+        if take_pin_digit(collector, digit):
+            return
         LOGGER.debug("[%s] DTMF digit received: %s", sip_config.username, digit)
         fire_sip_event(EVENT_SIP_DTMF_DIGIT, {"digit": digit})
         nonlocal ivr_session
@@ -345,14 +491,47 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         if assist_bridge is not None:
             assist_bridge.on_playback_done()
 
+    @callback
+    def on_playback_error(reason: str) -> None:
+        LOGGER.warning(
+            "[%s] Audio playback failed: %s", sip_config.username, reason
+        )
+        # Fire playback_done with an ``error`` so automations that wait for it
+        # (answer -> speak -> hang up) do not leave the call open; IVR moves on
+        # to its post_action / input and Assist to its next turn.
+        fire_sip_event(EVENT_SIP_PLAYBACK_DONE, {"error": reason})
+        nonlocal ivr_session, assist_bridge
+        if ivr_session is not None:
+            ivr_session.on_playback_done()
+        if assist_bridge is not None:
+            assist_bridge.on_playback_done()
+
+    @callback
+    def on_codec_change(codec) -> None:
+        nonlocal assist_bridge
+        if assist_bridge is not None:
+            assist_bridge.sample_rate = codec.sample_rate
+        recorder = entry.runtime_data.get("recorder")
+        if recorder is not None:
+            LOGGER.warning(
+                "[%s] Codec changed to %s (%s Hz) while recording; "
+                "the WAV header keeps the rate from when recording started",
+                sip_config.username,
+                codec.name,
+                codec.sample_rate,
+            )
+
     callbacks = SipCallbacks(
         on_state_change=on_state_change,
         on_registered=on_registered,
+        on_register_failed=on_register_failed,
         on_incoming_call=on_incoming_call,
         on_call_connected=on_call_connected,
         on_call_ended=on_call_ended,
         on_dtmf=on_dtmf,
         on_playback_done=on_playback_done,
+        on_playback_error=on_playback_error,
+        on_codec_change=on_codec_change,
     )
 
     client = SipClient(sip_config, callbacks)
@@ -377,6 +556,10 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     # Handle clean shutdown
     async def shutdown(event) -> None:
+        recorder = close_recorder_slot(entry.runtime_data)
+        client.clear_sinks()
+        if recorder is not None:
+            await recorder.wait_closed()
         await client.stop()
 
     entry.async_on_unload(
@@ -424,9 +607,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         noise_suppression: int = 0,
         turn_tone: bool = False,
         hangup_on_end: bool = False,
+        interrupt_media: bool = True,
     ) -> None:
         nonlocal assist_bridge
         if assist_bridge is not None:
+            client.remove_sink(assist_bridge)
             assist_bridge.close()
 
         bridge = AssistBridge(
@@ -445,8 +630,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             noise_suppression=noise_suppression,
             turn_tone=turn_tone,
             hangup_on_end=hangup_on_end,
+            interrupt_media=interrupt_media,
             stop_audio_fn=client.stop_audio,
             media_playing_fn=lambda: client.media_playing,
+            user_id=assist_user_id,
+            device_id=_sip_device_id(hass, entry.entry_id),
         )
 
         def on_assist_done() -> None:
@@ -454,14 +642,14 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
             if assist_bridge is not bridge:
                 return
             LOGGER.info("Assist pipeline bridge finished")
-            client.set_sink(NullSink())
+            client.remove_sink(bridge)
             assist_bridge = None
             if hangup_on_end:
                 client.hangup()
 
         bridge.on_done = on_assist_done
         assist_bridge = bridge
-        client.set_sink(assist_bridge)
+        client.add_sink(assist_bridge)
         assist_bridge.start()
 
     # Keep a dict of active IVR/Assist objects we can update
@@ -495,6 +683,10 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     entry_data = entry.runtime_data
     if entry_data:
         client: SipClient = entry_data["client"]
+        recorder = close_recorder_slot(entry_data)
+        client.clear_sinks()
+        if recorder is not None:
+            await recorder.wait_closed()
         await client.stop()
         # Clean up tasks
         start_task: asyncio.Task = entry_data.get("start_task")
@@ -507,6 +699,9 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         set_assist = entry_data.get("set_assist")
         if set_assist:
             set_assist(None)
+        ir.async_delete_issue(
+            hass, DOMAIN, register_auth_issue_id(entry.entry_id)
+        )
 
     unload_ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
 
@@ -535,6 +730,11 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     return unload_ok
 
 
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Delete the Assist system user created for this account."""
+    await remove_assist_user(hass, entry)
+
+
 async def async_register_services(hass: HomeAssistant) -> None:
     """Register services for the SIP integration."""
     if hass.services.has_service(DOMAIN, "dial"):
@@ -560,6 +760,17 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 if entry and entry.domain == DOMAIN and entry.state.value == "loaded":
                     matched_entries.append((entry.entry_id, entry.runtime_data))
 
+        has_explicit_target = any(
+            key in call.data
+            for key in ("entity_id", "device_id", "area_id", "floor_id", "label_id")
+        )
+        if not matched_entries and has_explicit_target:
+            # Never fall back to another account for a target the caller
+            # named; surface it so automations/Developer Tools see a failure.
+            raise ServiceValidationError(
+                "SIP service target did not match a loaded SIP account"
+            )
+
         if not matched_entries:
             # Fallback to the first loaded entry
             loaded_entries = [e for e in entries if e.state.value == "loaded"]
@@ -573,6 +784,42 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 matched_entries.append(
                     (loaded_entries[0].entry_id, loaded_entries[0].runtime_data)
                 )
+
+        # These are domain services, not entity-platform services, so HA does
+        # not enforce entity permissions for us. Mirror entity_service_call:
+        # a user-initiated call must be allowed to control the account's
+        # phone-line media_player. Calls without a user (automations, system)
+        # are not checked.
+        user_id = call.context.user_id
+        if user_id:
+            user = await hass.auth.async_get_user(user_id)
+            if user is None:
+                raise UnknownUser(
+                    context=call.context, permission=POLICY_CONTROL, user_id=user_id
+                )
+
+            registry = er.async_get(hass)
+            for entry_id, _data in matched_entries:
+                entity_ids = [
+                    entity.entity_id
+                    for entity in er.async_entries_for_config_entry(
+                        registry, entry_id
+                    )
+                    if entity.domain == "media_player" and entity.platform == DOMAIN
+                ]
+                # Admins pass even when no phone-line entity is registered
+                # (any([]) would otherwise lock them out); restricted users
+                # stay fail-closed.
+                if not user.is_admin and not any(
+                    user.permissions.check_entity(entity_id, POLICY_CONTROL)
+                    for entity_id in entity_ids
+                ):
+                    raise Unauthorized(
+                        context=call.context,
+                        permission=POLICY_CONTROL,
+                        user_id=user_id,
+                        perm_category=CAT_ENTITIES,
+                    )
 
         return matched_entries
 
@@ -607,9 +854,9 @@ async def async_register_services(hass: HomeAssistant) -> None:
             data["call_status"] = "canceled"
             data["call_number"] = number
 
-            # Load contacts asynchronously and cache them
-            contacts_data = await hass.async_add_executor_job(load_contacts, hass)
-            data["contacts"] = contacts_data
+            # Pick up any edits before resolving the callee's name.
+            await async_refresh_contacts(hass, data)
+            contacts_data = data.get("contacts", {})
 
             friendly_name, _ = get_contact_info_from_cache(contacts_data, number)
             data["last_caller"] = friendly_name
@@ -722,6 +969,9 @@ async def async_register_services(hass: HomeAssistant) -> None:
         from .sip_client.audio import WavRecorderSink
         import os
 
+        roots = _recording_roots(hass)
+        config_dir = hass.config.path()
+
         for entry_id, data in targets:
             client: SipClient = data["client"]
             target_file = recording_file
@@ -748,10 +998,29 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 if data["config"].username not in target_file:
                     target_file = f"{base}_{data['config'].username}{ext}"
 
+            try:
+                target_file = resolve_recording_path(str(target_file), config_dir)
+            except ValueError:
+                LOGGER.error("Recording path is empty")
+                continue
+            if not is_allowed_recording_path(target_file, roots):
+                LOGGER.error(
+                    "Recording path %s is outside allowed directories "
+                    "(config dir, allowlist_external_dirs, media_dirs, /media, /share)",
+                    target_file,
+                )
+                continue
+
+            old = close_recorder_slot(data)
+            if old is not None:
+                client.remove_sink(old)
+                await old.wait_closed()
+                _fire_recording_stopped(hass, entry_id, data)
+
             recorder = WavRecorderSink(
                 target_file, sample_rate=client.codec.sample_rate
             )
-            client.set_sink(recorder)
+            client.add_sink(recorder)
             data["recorder"] = recorder
             rec_data = {
                 "sip_account": data["config"].username,
@@ -772,24 +1041,12 @@ async def async_register_services(hass: HomeAssistant) -> None:
         targets = await get_client_entries(call)
         for entry_id, data in targets:
             client: SipClient = data["client"]
-            recorder = data.get("recorder")
-            if recorder:
-                recorder.close()
-                from .sip_client.audio import NullSink
-
-                client.set_sink(NullSink())
-                data.pop("recorder")
-                stop_data = {"sip_account": data["config"].username}
-                device_id = _sip_device_id(hass, entry_id)
-                if device_id:
-                    stop_data["device_id"] = device_id
-                hass.bus.async_fire(EVENT_SIP_RECORDING_STOPPED, stop_data)
-                async_dispatcher_send(
-                    hass,
-                    f"{DOMAIN}_event_{entry_id}",
-                    EVENT_SIP_RECORDING_STOPPED,
-                    None,
-                )
+            recorder = close_recorder_slot(data)
+            if recorder is None:
+                continue
+            client.remove_sink(recorder)
+            await recorder.wait_closed()
+            _fire_recording_stopped(hass, entry_id, data)
 
     async def handle_start_assist(call: ServiceCall) -> None:
         targets = await get_client_entries(call)
@@ -807,10 +1064,52 @@ async def async_register_services(hass: HomeAssistant) -> None:
                 "noise_suppression",
                 "turn_tone",
                 "hangup_on_end",
+                "interrupt_media",
             )
             if k in call.data
         }
+        allowed_callers = call.data.get("allowed_callers")
+        contacts_only = bool(call.data.get("contacts_only"))
+        pin = call.data.get("pin") or ""
         for entry_id, data in targets:
+            caller = str(data.get("call_number") or "")
+            if not caller_is_allowed(
+                caller,
+                allowed_callers=allowed_callers,
+                contacts=data.get("contacts"),
+                contacts_only=contacts_only,
+            ):
+                LOGGER.info("Assist rejected for caller %s (not allowed)", caller)
+                _fire_assist_rejected(
+                    hass, entry_id, data, caller, REASON_NOT_ALLOWED
+                )
+                continue
+            # A ``sip.dial`` / ``sip.answer`` ``message`` (or menu) leaves an
+            # IVR session armed, usually with ``post_action: hangup``. Hold
+            # it while the PIN is collected (its announcement ending must not
+            # hang up under the prompt) and retire it once Assist owns the
+            # line, so Assist's own playback_done cannot trigger it (#92).
+            get_ivr = data.get("get_ivr")
+            ivr = get_ivr() if get_ivr is not None else None
+            if pin:
+                collector = PinCollector(pin)
+                data["pin_collector"] = collector
+                if ivr is not None:
+                    ivr.suspend()
+                try:
+                    pin_result = await collector.wait()
+                finally:
+                    data["pin_collector"] = None
+                if pin_result != "ok":
+                    if ivr is not None:
+                        ivr.resume()
+                    LOGGER.info("Assist rejected for caller %s (%s)", caller, pin_result)
+                    _fire_assist_rejected(hass, entry_id, data, caller, pin_result)
+                    continue
+                ivr = get_ivr() if get_ivr is not None else None
+            if ivr is not None:
+                ivr.close()
+                data["set_ivr"](None)
             await data["trigger_assist_fn"](**opts)
 
     # Register all services

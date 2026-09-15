@@ -22,6 +22,7 @@ import struct
 from typing import Callable
 
 from . import codecs
+from . import trace
 from .codecs import Codec
 
 _LOGGER = logging.getLogger(__name__)
@@ -32,6 +33,23 @@ FRAME_BYTES = SAMPLES_PER_FRAME * 2  # s16le @ 8 kHz
 FRAME_SEC = 0.02
 _DTMF_TONE_SAMPLES = 8 * SAMPLES_PER_FRAME  # ~160 ms, in CLOCK ticks
 _DTMF_END_PACKETS = 3
+# Asterisk strictrtp-style consecutive learn count (typical 3–5).
+_LATCH_LEARN_COUNT = 4
+_LATCH_SEQ_GAP_MAX = 64
+_TRACE_INTERVAL = 5.0
+_TRACE_LOSS_GAP_MAX = 2000
+
+
+def _rtp_seq_follows(prev: int, seq: int) -> bool:
+    """True if ``seq`` is a plausible next RTP sequence number after ``prev``."""
+    delta = (seq - prev) & 0xFFFF
+    return 1 <= delta <= _LATCH_SEQ_GAP_MAX
+
+
+def _fmt_endpoint(addr: tuple[str, int] | None) -> str:
+    if addr is None:
+        return "-"
+    return f"{addr[0]}:{addr[1]}"
 
 
 def _dtmf_event_to_char(event: int) -> str | None:
@@ -61,11 +79,11 @@ def _dtmf_char_to_event(c: str) -> int:
 
 
 class _RtpProtocol(asyncio.DatagramProtocol):
-    def __init__(self, on_packet: Callable[[bytes], None]) -> None:
+    def __init__(self, on_packet: Callable[[bytes, tuple], None]) -> None:
         self._on_packet = on_packet
 
     def datagram_received(self, data: bytes, addr) -> None:  # noqa: D401
-        self._on_packet(data)
+        self._on_packet(data, addr)
 
     def error_received(self, exc) -> None:
         _LOGGER.debug("RTP socket error: %s", exc)
@@ -78,8 +96,16 @@ class RtpSession:
         self._sender_task: asyncio.Task | None = None
 
         self._remote: tuple[str, int] | None = None
+        self._sdp_remote: tuple[str, int] | None = None
+        self._latched_remote: tuple[str, int] | None = None
+        self._latch_candidate: tuple[str, int] | None = None
+        self._latch_ssrc: int | None = None
+        self._latch_seq: int | None = None
+        self._latch_count = 0
         self.dtmf_pt = 101
         self.send_silence = True
+        self.tx_enabled = True
+        self._tx_paused_at: float | None = None
 
         self._seq = 0
         self._timestamp = 0
@@ -102,6 +128,15 @@ class RtpSession:
 
         self.on_audio: Callable[[bytes], None] | None = None
         self.on_dtmf: Callable[[str], None] | None = None
+        self.on_media_timeout: Callable[[], None] | None = None
+        self.media_timeout: float = 30.0
+        self.expect_rx = True
+        self._last_rx_at: float | None = None
+        self._media_timeout_handle: asyncio.TimerHandle | None = None
+        self._trace_handle: asyncio.TimerHandle | None = None
+        self.bytes_received = 0
+        self.bytes_sent = 0
+        self._reset_trace_stats()
 
         # Codec-derived pacing / encode state (defaults = G.711 PCMU).
         self._codec: Codec = codecs.DEFAULT
@@ -118,7 +153,83 @@ class RtpSession:
 
     # -- configuration --------------------------------------------------
     def set_remote(self, ip: str, port: int) -> None:
-        self._remote = (ip, port)
+        dest = (ip, port)
+        self._sdp_remote = dest
+        self._remote = dest
+        # New SDP (initial or re-INVITE): learn the new peer from scratch.
+        self._reset_latch()
+
+    def _clear_latch_candidate(self) -> None:
+        self._latch_candidate = None
+        self._latch_ssrc = None
+        self._latch_seq = None
+        self._latch_count = 0
+
+    def _reset_latch(self) -> None:
+        self._latched_remote = None
+        self._clear_latch_candidate()
+        if self._sdp_remote is not None:
+            self._remote = self._sdp_remote
+
+    @property
+    def sdp_remote(self) -> tuple[str, int] | None:
+        """Remote RTP address from SDP ``c=`` / ``m=``, before latching."""
+        return self._sdp_remote
+
+    @property
+    def latched_remote(self) -> tuple[str, int] | None:
+        """Actual source address after symmetric RTP latch, or None if unused."""
+        return self._latched_remote
+
+    def set_tx_enabled(self, enabled: bool) -> None:
+        """Gate RTP transmission; on resume, catch up the RTP timestamp.
+
+        While TX is paused the sender loop does not advance ``_timestamp``.
+        Jumping it by the elapsed 20 ms frames (and re-marking the next
+        packet) keeps a long hold from looking like a burst of late packets.
+        """
+        if enabled == self.tx_enabled:
+            return
+        if enabled:
+            if self._tx_paused_at is not None:
+                elapsed = max(0.0, self._loop.time() - self._tx_paused_at)
+                frames = int(elapsed / FRAME_SEC)
+                if frames:
+                    self._timestamp = (
+                        self._timestamp + frames * self._ts_increment
+                    ) & 0xFFFFFFFF
+                self._first_packet = True
+            self._tx_paused_at = None
+            self.tx_enabled = True
+            # Hold ended: restart the RX watchdog so a long hold is not a timeout.
+            if self._transport is not None:
+                self._note_rx()
+            return
+        self._tx_paused_at = self._loop.time()
+        self.tx_enabled = False
+        self.flush_tx_buffer()
+        self._clear_dtmf_tx()
+        self._cancel_media_timeout()
+
+    def set_expect_rx(self, expected: bool) -> None:
+        """Arm the RX watchdog only when the peer is supposed to send RTP.
+
+        A recvonly peer (paging speaker) never transmits, so a media timeout
+        would cut a long announcement. Hold already gates this via ``tx_enabled``.
+        """
+        if expected == self.expect_rx:
+            return
+        self.expect_rx = expected
+        if expected:
+            if self._transport is not None and self.tx_enabled:
+                self._note_rx()
+            return
+        self._cancel_media_timeout()
+
+    def clear_tx_pause(self) -> None:
+        """Re-enable TX without catching up a hold gap (new/ended call)."""
+        self.tx_enabled = True
+        self._tx_paused_at = None
 
     def set_codec(self, codec: Codec) -> None:
         """Bind the negotiated codec and (re)create encoder/decoder state."""
@@ -164,11 +275,12 @@ class RtpSession:
         self._ssrc = struct.unpack("<I", os.urandom(4))[0]
         self._first_packet = True
         self._tx_buffer.clear()
-        self._dtmf_queue.clear()
-        self._dtmf_active = False
+        self._clear_dtmf_tx()
         self._rx_dtmf_timestamp = -1
+        self._reset_latch()
         # Fresh codec state for this call (important for stateful codecs).
         self.set_codec(self._codec)
+        self.reset_byte_counters()
         self._sender_task = self._loop.create_task(self._sender())
         _LOGGER.info(
             "RTP started on port %s (pt=%s, dtmf_pt=%s)",
@@ -181,9 +293,15 @@ class RtpSession:
                 "Remote did not negotiate telephone-event (RFC 2833); inbound DTMF "
                 "will only work if the device sends it via SIP INFO"
             )
+        self._note_rx()
+        self._reset_trace_stats()
+        self._arm_trace()
         return True
 
     async def stop(self) -> None:
+        self._cancel_media_timeout()
+        self._cancel_trace()
+        self._last_rx_at = None
         if self._sender_task is not None:
             self._sender_task.cancel()
             try:
@@ -195,14 +313,19 @@ class RtpSession:
             self._transport.close()
             self._transport = None
         self._tx_buffer.clear()
-        self._dtmf_queue.clear()
-        self._dtmf_active = False
+        self._clear_dtmf_tx()
         self._rx_dtmf_timestamp = -1
+        self.reset_byte_counters()
+
+    def reset_byte_counters(self) -> None:
+        """Drop TX/RX PCM totals so a new dialog cannot inherit the last call."""
+        self.bytes_received = 0
+        self.bytes_sent = 0
 
     # -- TX -------------------------------------------------------------
     def push_tx_audio(self, pcm_le: bytes) -> None:
         """Queue captured PCM (s16le, mono, codec sample rate) for transmission."""
-        if self._transport is None:
+        if self._transport is None or not self.tx_enabled:
             return
         self._tx_buffer.extend(pcm_le)
         if len(self._tx_buffer) > self._tx_buffer_max:
@@ -212,6 +335,14 @@ class RtpSession:
     def flush_tx_buffer(self) -> None:
         """Drop queued PCM not yet sent (e.g. after barge-in)."""
         self._tx_buffer.clear()
+
+    def _clear_dtmf_tx(self) -> None:
+        """Drop in-flight and queued DTMF so a later resume cannot rewind RTP time."""
+        self._dtmf_queue.clear()
+        self._dtmf_active = False
+        self._dtmf_event = -1
+        self._dtmf_duration = 0
+        self._dtmf_end_packets = 0
 
     def queue_dtmf(self, digits: str) -> None:
         if self.dtmf_pt < 0:
@@ -240,10 +371,13 @@ class RtpSession:
     def _send(self, packet: bytes) -> None:
         if self._transport is not None and self._remote is not None:
             self._transport.sendto(packet, self._remote)
+            self._note_trace_tx(packet)
 
     def _send_audio_packet(self, frame: bytes) -> None:
         header = self._rtp_header(self._first_packet, self.payload_type, self._timestamp)
         self._send(header + self._encode(frame))
+        if self._transport is not None and self._remote is not None:
+            self.bytes_sent += len(frame)
         self._seq += 1
         self._timestamp += self._ts_increment
         self._first_packet = False
@@ -291,7 +425,7 @@ class RtpSession:
         while True:
             next_t += FRAME_SEC
             try:
-                if self._remote is not None:
+                if self._remote is not None and self.tx_enabled:
                     if self._dtmf_active or self._dtmf_queue:
                         self._send_dtmf_packet()
                     elif len(self._tx_buffer) >= self._pcm_frame_bytes:
@@ -309,21 +443,166 @@ class RtpSession:
                 # Running behind; resync so we don't spin.
                 next_t = self._loop.time()
 
-    # -- RX -------------------------------------------------------------
-    def _receive(self, data: bytes) -> None:
+    def _maybe_latch(self, addr, seq: int, ssrc: int) -> None:
+        """Retarget TX after N consecutive valid packets from a new source.
+
+        Symmetric RTP / NAT: the SDP ``c=`` line often carries a private
+        address while packets actually arrive from a mapped public endpoint.
+        A single datagram must not pin TX (RTP scanners on an exposed port).
+        Learning is allowed again later so a mid-call NAT remap can recover:
+        the same new source must deliver RTP v2, a stable SSRC, and an
+        increasing sequence for ``_LATCH_LEARN_COUNT`` packets. Traffic from
+        the current dest resets any competing candidate.
+        """
+        if addr is None or self._remote is None:
+            return
+        src = (addr[0], int(addr[1]))
+        if src == self._remote:
+            self._clear_latch_candidate()
+            return
+        if (
+            self._latch_candidate == src
+            and self._latch_ssrc == ssrc
+            and self._latch_seq is not None
+            and _rtp_seq_follows(self._latch_seq, seq)
+        ):
+            self._latch_seq = seq
+            self._latch_count += 1
+        else:
+            self._latch_candidate = src
+            self._latch_ssrc = ssrc
+            self._latch_seq = seq
+            self._latch_count = 1
+        if self._latch_count < _LATCH_LEARN_COUNT:
+            return
+        _LOGGER.info(
+            "RTP latched remote %s:%s -> %s:%s",
+            self._remote[0],
+            self._remote[1],
+            src[0],
+            src[1],
+        )
+        self._latched_remote = src
+        self._remote = src
+        self._clear_latch_candidate()
+
+    def _note_rx(self) -> None:
+        self._last_rx_at = self._loop.time()
+        self._arm_media_timeout()
+
+    def _arm_media_timeout(self) -> None:
+        self._cancel_media_timeout()
+        if (
+            self.media_timeout <= 0
+            or self._transport is None
+            or not self.tx_enabled
+            or not self.expect_rx
+        ):
+            return
+        self._media_timeout_handle = self._loop.call_later(
+            self.media_timeout, self._fire_media_timeout
+        )
+
+    def _cancel_media_timeout(self) -> None:
+        if self._media_timeout_handle is not None:
+            self._media_timeout_handle.cancel()
+            self._media_timeout_handle = None
+
+    def _fire_media_timeout(self) -> None:
+        self._media_timeout_handle = None
+        if self._transport is None or not self.tx_enabled or not self.expect_rx:
+            return
+        _LOGGER.warning(
+            "RTP media timeout after %ss without RX", self.media_timeout
+        )
+        cb = self.on_media_timeout
+        if cb is None:
+            return
         try:
-            self._receive_impl(data)
+            cb()
+        except Exception:  # noqa: BLE001
+            _LOGGER.exception("on_media_timeout raised")
+
+    def _reset_trace_stats(self) -> None:
+        self._trace_rx = 0
+        self._trace_tx = 0
+        self._trace_rx_pt: int | None = None
+        self._trace_tx_pt: int | None = None
+        self._trace_lost = 0
+        self._trace_rx_seq: int | None = None
+
+    def _arm_trace(self) -> None:
+        self._cancel_trace()
+        self._trace_handle = self._loop.call_later(
+            _TRACE_INTERVAL, self._trace_tick
+        )
+
+    def _cancel_trace(self) -> None:
+        if self._trace_handle is not None:
+            self._trace_handle.cancel()
+            self._trace_handle = None
+
+    def _trace_tick(self) -> None:
+        self._trace_handle = None
+        self._emit_rtp_trace()
+        if self._transport is not None:
+            self._arm_trace()
+
+    def _emit_rtp_trace(self) -> None:
+        if not trace.enabled():
+            return
+        trace.log_rtp(
+            "RTP %ss: rx=%s tx=%s pt=%s/%s lost~%s latch=%s sdp=%s",
+            int(_TRACE_INTERVAL),
+            self._trace_rx,
+            self._trace_tx,
+            "-" if self._trace_rx_pt is None else self._trace_rx_pt,
+            "-" if self._trace_tx_pt is None else self._trace_tx_pt,
+            self._trace_lost,
+            _fmt_endpoint(self._latched_remote),
+            _fmt_endpoint(self._sdp_remote),
+        )
+        self._reset_trace_stats()
+
+    def _note_trace_tx(self, packet: bytes) -> None:
+        self._trace_tx += 1
+        if len(packet) >= 2:
+            self._trace_tx_pt = packet[1] & 0x7F
+
+    def _note_trace_rx(self, seq: int, pt: int) -> None:
+        self._trace_rx += 1
+        self._trace_rx_pt = pt
+        if self._trace_rx_seq is not None:
+            delta = (seq - self._trace_rx_seq) & 0xFFFF
+            if 1 < delta <= _TRACE_LOSS_GAP_MAX:
+                self._trace_lost += delta - 1
+        self._trace_rx_seq = seq
+
+    # -- RX -------------------------------------------------------------
+    def _receive(self, data: bytes, addr: tuple[str, int] | None = None) -> None:
+        try:
+            self._receive_impl(data, addr)
         except Exception:  # noqa: BLE001 - a bad RTP packet must not kill the session
             _LOGGER.exception("Error handling RTP packet (ignored)")
 
-    def _receive_impl(self, data: bytes) -> None:
+    def _receive_impl(
+        self, data: bytes, addr: tuple[str, int] | None = None
+    ) -> None:
         if len(data) < 12:
             return
+        if data[0] >> 6 != 2:
+            return
+        # Comfort noise (PT 13) and other keepalives must reset the watchdog
+        # even when we cannot decode them. Latch still requires a known PT.
+        self._note_rx()
         pt = data[1] & 0x7F
         marker = (data[1] & 0x80) != 0
         header_len = 12 + 4 * (data[0] & 0x0F)  # CSRC count
         if len(data) <= header_len:
             return
+        seq = int.from_bytes(data[2:4], "big")
+        ssrc = int.from_bytes(data[8:12], "big")
+        self._note_trace_rx(seq, pt)
 
         payload_len = len(data) - header_len
         is_dtmf = pt == self.dtmf_pt if self.dtmf_pt >= 0 else False
@@ -340,6 +619,7 @@ class RtpSession:
             is_dtmf = True
 
         if is_dtmf:
+            self._maybe_latch(addr, seq, ssrc)
             # Not every device sets the marker bit on the first packet of an
             # event, so key off the RTP timestamp instead: all packets of one
             # keypress repeat the same timestamp. The marker bit, when present,
@@ -360,5 +640,8 @@ class RtpSession:
         decode = self._decoder_for(pt)
         if decode is None:
             return
+        self._maybe_latch(addr, seq, ssrc)
+        pcm = decode(data[header_len:])
+        self.bytes_received += len(pcm)
         if self.on_audio is not None:
-            self.on_audio(decode(data[header_len:]))
+            self.on_audio(pcm)

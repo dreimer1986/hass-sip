@@ -14,12 +14,14 @@
           "caller_id": "Anrufer-ID (Optional)",
           "outbound_proxy": "Outbound-Proxy (Optional)",
           "register_expiration": "Registrierungs-Ablaufzeit (Sekunden)",
-          "local_rtp_port": "Lokaler RTP-Port (Optional)"
+          "local_rtp_port": "Lokaler RTP-Port (Optional)",
+          "media_timeout": "Medien-Timeout (Sekunden, 0=deaktiviert)",
+          "max_call_duration": "Maximale Gesprächsdauer (Sekunden, 0=unbegrenzt)"
         }
       },
       "reconfigure": {
         "title": "SIP-Client bearbeiten",
-        "description": "Aktualisiere deine SIP-Nebenstellendaten und Serverdetails.",
+        "description": "Aktualisiere deine SIP-Nebenstellendaten und Serverdetails. Passwort leer lassen, um das aktuelle zu behalten.",
         "data": {
           "server": "SIP-Server / Host",
           "port": "Port",
@@ -30,7 +32,9 @@
           "caller_id": "Anrufer-ID (Optional)",
           "outbound_proxy": "Outbound-Proxy (Optional)",
           "register_expiration": "Registrierungs-Ablaufzeit (Sekunden)",
-          "local_rtp_port": "Lokaler RTP-Port (Optional)"
+          "local_rtp_port": "Lokaler RTP-Port (Optional)",
+          "media_timeout": "Medien-Timeout (Sekunden, 0=deaktiviert)",
+          "max_call_duration": "Maximale Gesprächsdauer (Sekunden, 0=unbegrenzt)"
         }
       }
     },
@@ -61,11 +65,29 @@
           "incoming": "Eingehend",
           "outgoing": "Ausgehend"
         }
+      },
+      "negotiated_codec": {
+        "name": "Verhandelter Codec"
+      },
+      "call_audio": {
+        "name": "Anruf-Audio",
+        "state": {
+          "none": "Kein Medium",
+          "no_rx": "Kein Empfang (einseitig)",
+          "no_tx": "Kein Senden (einseitig)",
+          "bidirectional": "Bidirektional"
+        }
+      },
+      "last_call_reason": {
+        "name": "Letzter Auflegegrund"
       }
     },
     "binary_sensor": {
       "call_active": {
         "name": "Anruf aktiv"
+      },
+      "audio_bidirectional": {
+        "name": "Bidirektionales Audio"
       }
     },
     "switch": {
@@ -99,7 +121,8 @@
               "ended": "Anruf beendet",
               "recording_started": "Aufnahme gestartet",
               "recording_stopped": "Aufnahme gestoppt",
-              "registered": "Registriert"
+              "registered": "Registriert",
+              "assist_rejected": "Assist abgelehnt"
             }
           }
         }
@@ -193,7 +216,7 @@
       "fields": {
         "recording_file": {
           "name": "Aufnahmedateipfad",
-          "description": "Absoluter Pfad der zu speichernden WAV-Datei (z.B. /media/recording.wav)."
+          "description": "Pfad der WAV-Datei. Relative Pfade gelten ab dem Home-Assistant-Konfigurationsverzeichnis. Muss in einem erlaubten Verzeichnis liegen (Config, allowlist_external_dirs, /media oder /share)."
         }
       }
     },
@@ -248,8 +271,30 @@
         "hangup_on_end": {
           "name": "Bei Ende auflegen",
           "description": "Anruf beenden, wenn die Assist-Sitzung endet."
+        },
+        "interrupt_media": {
+          "name": "Medienwiedergabe unterbrechen",
+          "description": "Aktuelle Medienwiedergabe stoppen und verwerfen, sobald Assist zum Zuhören oder Abspielen der ersten Antwort bereit ist. Während Pipeline-, LLM- und TTS-Start kann die Wiedergabe weiterlaufen. Auf false setzen, damit die aktuelle Wiedergabe vor der ersten Assist-Runde zu Ende läuft."
+        },
+        "allowed_callers": {
+          "name": "Erlaubte Anrufer",
+          "description": "Anrufer-IDs, die Assist starten dürfen. Ohne Angabe keine Einschränkung. Caller-ID ist fälschbar; für Türschloss-Intents zusätzlich PIN verwenden."
+        },
+        "contacts_only": {
+          "name": "Nur Kontakte",
+          "description": "Nur in sip_contacts.json eingetragene Anrufer dürfen Assist starten. Zusammen mit Erlaubte Anrufer müssen beide zutreffen."
+        },
+        "pin": {
+          "name": "PIN",
+          "description": "Optionale DTMF-PIN. Muss vor Assist eingegeben werden (# oder PIN-Länge). Fehlversuch oder Timeout löst sip_assist_rejected aus und führt keine Intents aus."
         }
       }
+    }
+  },
+  "issues": {
+    "register_auth_failed": {
+      "title": "SIP-Registrierung wurde abgelehnt",
+      "description": "Der SIP-Server `{server}` hat die Registrierung für `{username}` abgelehnt ({reason}). Benutzername und Passwort in den Integrationseinstellungen prüfen. Wiederholungen werden automatisch verlangsamt, damit der Server diese IP nicht sperrt."
     }
   }
 }

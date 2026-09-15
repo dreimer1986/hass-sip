@@ -1,7 +1,9 @@
 """Home Assistant Assist Pipeline integration for SIP Client."""
 from __future__ import annotations
 
+import array
 import asyncio
+import math
 from collections.abc import AsyncIterable, Callable
 from typing import Literal
 
@@ -46,6 +48,8 @@ _ERROR_TURN_BACKOFF_SECONDS = 1.0
 _VAD_FRAME_BYTES = 320  # 10 ms @ 16 kHz s16le mono
 _VAD_SPEECH_THRESHOLD = 0.5
 _VAD_MIN_SPEECH_FRAMES = 30  # 300 ms consecutive speech
+# Shorter than barge-in: a 100 ms utterance after TTS must still count.
+_GAP_MIN_SPEECH_FRAMES = 5  # 50 ms consecutive speech
 _PREROLL_MAX_BYTES = 16000  # 500 ms @ 16 kHz s16le mono
 _TX_IDLE_TIMEOUT_SECONDS = 60.0
 _TONE_WAIT_TIMEOUT_SECONDS = 3
@@ -56,16 +60,85 @@ _TTS_WAIT_TIMEOUT_SECONDS = 300
 _TxWaitKind = Literal["tts", "tone"]
 
 
-def _upsample_pcm(pcm_le: bytes, sample_rate: int) -> bytes:
-    """Return 16 kHz s16le mono PCM for Assist STT / VAD."""
+def _halfband_odd_taps(half: int = 15) -> tuple[float, ...]:
+    """Odd-phase taps of a 2× Hamming half-band interpolator.
+
+    ``half=15`` is a 31-tap filter (n = −15..15). Even taps are 0 except the
+    centre tap of 1; these values are h[1], h[3], … h[15], scaled so DC gain
+    is exactly 2 (the factor that restores amplitude after zero-insertion).
+    """
+    raw: list[float] = []
+    for n in range(1, half + 1, 2):
+        sign = 1.0 if ((n - 1) // 2) % 2 == 0 else -1.0
+        ideal = sign * 2.0 / (math.pi * n)
+        window = 0.54 + 0.46 * math.cos(math.pi * n / half)
+        raw.append(ideal * window)
+    scale = 0.5 / sum(raw)
+    return tuple(c * scale for c in raw)
+
+
+# 8 input-sample (1 ms @ 8 kHz) group delay; 16-deep delay line.
+_UPSAMPLE_ODD_TAPS = _halfband_odd_taps()
+_UPSAMPLE_HIST = len(_UPSAMPLE_ODD_TAPS) * 2
+
+
+class _Upsampler2x:
+    """Causal 8 kHz → 16 kHz polyphase interpolator with anti-imaging LPF.
+
+    Even output samples are delayed originals; odd samples are the
+    interpolating phase. History is kept across ``process()`` calls so
+    20 ms RTP frames do not click at the boundaries.
+    """
+
+    __slots__ = ("_hist",)
+
+    def __init__(self) -> None:
+        self._hist = array.array("h", [0] * _UPSAMPLE_HIST)
+
+    def process(self, pcm_le: bytes) -> bytes:
+        n_in = len(pcm_le) // 2
+        if n_in == 0:
+            return b""
+        src = array.array("h")
+        src.frombytes(pcm_le[: n_in * 2])
+        hist = self._hist
+        taps = _UPSAMPLE_ODD_TAPS
+        center = len(taps) - 1
+        out = array.array("h", [0] * (n_in * 2))
+        oi = 0
+        for sample in src:
+            hist[:-1] = hist[1:]
+            hist[-1] = sample
+            even = hist[center]
+            acc = 0.0
+            for j, coeff in enumerate(taps):
+                acc += coeff * (hist[center - j] + hist[center + 1 + j])
+            odd = int(acc)
+            if odd > 32767:
+                odd = 32767
+            elif odd < -32768:
+                odd = -32768
+            out[oi] = even
+            out[oi + 1] = odd
+            oi += 2
+        return out.tobytes()
+
+
+def _upsample_pcm(
+    pcm_le: bytes,
+    sample_rate: int,
+    upsampler: _Upsampler2x | None = None,
+) -> bytes:
+    """Return 16 kHz s16le mono PCM for Assist STT / VAD.
+
+    G.722 (16 kHz) is a no-op. 8 kHz G.711 is interpolated by 2 with a
+    half-band FIR so the 4–8 kHz images of sample-and-hold do not reach STT.
+    """
     if sample_rate == 16000:
         return pcm_le
-    resampled = bytearray(len(pcm_le) * 2)
-    for i in range(0, len(pcm_le), 2):
-        sample = pcm_le[i : i + 2]
-        resampled[i * 2 : i * 2 + 2] = sample
-        resampled[i * 2 + 2 : i * 2 + 4] = sample
-    return bytes(resampled)
+    if upsampler is None:
+        upsampler = _Upsampler2x()
+    return upsampler.process(pcm_le)
 
 
 def _stt_text(data: dict | None) -> str:
@@ -135,8 +208,11 @@ class AssistBridge(AudioSink):
         noise_suppression: int = 0,
         turn_tone: bool = False,
         hangup_on_end: bool = False,
+        interrupt_media: bool = True,
         stop_audio_fn: Callable[..., None] | None = None,
         media_playing_fn: Callable[[], bool] | None = None,
+        user_id: str | None = None,
+        device_id: str | None = None,
     ) -> None:
         """Initialize the Assist bridge."""
         self.hass = hass
@@ -157,8 +233,11 @@ class AssistBridge(AudioSink):
         self.silence_seconds = silence_seconds
         self.noise_suppression = noise_suppression
         self.turn_tone = turn_tone
+        self._interrupt_media_pending = interrupt_media
         self.stop_audio_fn = stop_audio_fn
         self.media_playing_fn = media_playing_fn
+        self._context = Context(user_id=user_id)
+        self._device_id = device_id
 
         if barge_in and MicroVad is None:
             LOGGER.warning(
@@ -183,23 +262,44 @@ class AssistBridge(AudioSink):
         self._vad_speech_frames = 0
         self._post_barge_in_capture = False
         self._tts_epoch = 0
-        self._tone_capture = bytearray()
+        self._upsampler = _Upsampler2x()
         self._micro_vad = MicroVad() if self.barge_in else None
+        self._gap_vad = MicroVad() if MicroVad is not None else None
+        self._gap_pending = bytearray()
+        self._gap_speech_frames = 0
+        self._gap_has_speech = False
 
     def start(self) -> None:
         """Start the Assist session loop in the background."""
         self.session_task = asyncio.create_task(self._run_session())
 
+    def _to_16k(self, pcm_le: bytes) -> bytes:
+        """Upsample G.711 RX to 16 kHz, keeping FIR history across frames."""
+        if self.sample_rate == 16000:
+            return pcm_le
+        return self._upsampler.process(pcm_le)
+
     def write(self, pcm_le: bytes) -> None:
-        """Receive incoming PCM from SIP client and feed it to Assist."""
+        """Receive incoming PCM from SIP client and feed it to Assist.
+
+        While a turn is live, PCM goes to STT. After TTS finishes, RX is kept
+        in the ring so speech that starts before ``_listening`` is not lost.
+        TTS playback itself is not captured unless barge-in is armed. A
+        successful turn-start tone drops the ring (beep echo must not reach
+        STT); MicroVad, when present, also withholds gap preroll that is not
+        speech so speakerphone echo of the reply is less likely to become a
+        command.
+        """
+        pcm_16k = self._to_16k(pcm_le)
         if self._listening:
-            self.audio_stream.feed_audio(pcm_le, self.sample_rate)
-        elif self._tx_wait == "tone":
-            self._append_tone_capture(_upsample_pcm(pcm_le, self.sample_rate))
+            self.audio_stream.feed_audio(pcm_16k, 16000)
         elif self._post_barge_in_capture:
-            self._append_rx_to_ring(_upsample_pcm(pcm_le, self.sample_rate))
+            self._append_rx_to_ring(pcm_16k)
         elif self.barge_in and self._speaking:
-            self._monitor_barge_in(pcm_le)
+            self._monitor_barge_in(pcm_16k)
+        elif not self._speaking:
+            self._append_rx_to_ring(pcm_16k)
+            self._monitor_gap_speech(pcm_16k)
 
     def on_playback_done(self) -> None:
         """Signal that TX playback has finished (see IvrSession for the same pattern).
@@ -231,10 +331,49 @@ class AssistBridge(AudioSink):
         if len(self._ring_buffer) > _PREROLL_MAX_BYTES:
             del self._ring_buffer[: len(self._ring_buffer) - _PREROLL_MAX_BYTES]
 
-    def _append_tone_capture(self, pcm_16k: bytes) -> None:
-        self._tone_capture.extend(pcm_16k)
-        if len(self._tone_capture) > _PREROLL_MAX_BYTES:
-            del self._tone_capture[: len(self._tone_capture) - _PREROLL_MAX_BYTES]
+    def _discard_gap_capture(self) -> None:
+        """Drop turn-gap RX (used after a completed turn-start tone)."""
+        self._ring_buffer.clear()
+        self._gap_pending.clear()
+        self._gap_speech_frames = 0
+        self._gap_has_speech = False
+
+    def _take_preroll(self) -> bytes:
+        """Return buffered RX (barge-in + turn-gap) and clear capture state.
+
+        Barge-in always keeps the ring. Otherwise, if MicroVad is loaded and
+        heard no speech in the gap, the ring is dropped so TTS/tone echo is
+        not forwarded to STT.
+        """
+        barge = self._barge_in_preroll
+        ring = bytes(self._ring_buffer)
+        if barge or self._post_barge_in_capture:
+            preroll = barge + ring
+        elif self._gap_vad is not None and not self._gap_has_speech:
+            preroll = b""
+        else:
+            preroll = ring
+        self._barge_in_preroll = b""
+        self._post_barge_in_capture = False
+        self._reset_barge_in_state()
+        return preroll
+
+    def _monitor_gap_speech(self, pcm_16k: bytes) -> None:
+        """Mark the turn-gap ring as containing caller speech when VAD agrees."""
+        if self._gap_vad is None or self._gap_has_speech:
+            return
+        self._gap_pending.extend(pcm_16k)
+        while len(self._gap_pending) >= _VAD_FRAME_BYTES:
+            frame = bytes(self._gap_pending[:_VAD_FRAME_BYTES])
+            del self._gap_pending[:_VAD_FRAME_BYTES]
+            if self._gap_vad.Process10ms(frame) >= _VAD_SPEECH_THRESHOLD:
+                self._gap_speech_frames += 1
+                if self._gap_speech_frames >= _GAP_MIN_SPEECH_FRAMES:
+                    self._gap_has_speech = True
+                    self._gap_pending.clear()
+                    return
+            else:
+                self._gap_speech_frames = 0
 
     def _cancel_inflight_tts(self, *, stop_audio: bool = False) -> None:
         """Drop in-flight TTS fetch/play tasks (barge-in, timeout, close)."""
@@ -264,9 +403,17 @@ class AssistBridge(AudioSink):
                 _TX_IDLE_TIMEOUT_SECONDS,
             )
 
-    def _monitor_barge_in(self, pcm_le: bytes) -> None:
+    def _interrupt_media_when_ready(self) -> None:
+        """Stop pre-Assist media at the first listening/playback boundary."""
+        if not self._interrupt_media_pending:
+            return
+        self._interrupt_media_pending = False
+        if self.stop_audio_fn:
+            # Sources are paced ahead into RTP, so discard queued PCM too.
+            self.stop_audio_fn(flush=True)
+
+    def _monitor_barge_in(self, pcm_16k: bytes) -> None:
         """Detect caller speech during TTS playback and trigger barge-in."""
-        pcm_16k = _upsample_pcm(pcm_le, self.sample_rate)
         self._append_rx_to_ring(pcm_16k)
 
         self._vad_pending.extend(pcm_16k)
@@ -310,9 +457,9 @@ class AssistBridge(AudioSink):
         return AudioSettings(**kwargs)
 
     def _reset_barge_in_state(self) -> None:
-        self._ring_buffer.clear()
         self._vad_pending.clear()
         self._vad_speech_frames = 0
+        self._discard_gap_capture()
 
     async def _run_session(self) -> None:
         """Run consecutive Assist pipeline turns until a stop condition."""
@@ -356,25 +503,20 @@ class AssistBridge(AudioSink):
 
             while self._running:
                 self.audio_stream = AssistAudioStream()
-                preroll = self._barge_in_preroll
-                self._barge_in_preroll = b""
-                if self._post_barge_in_capture:
-                    if self._ring_buffer:
-                        preroll = preroll + bytes(self._ring_buffer)
-                    self._post_barge_in_capture = False
-                if preroll:
-                    self.audio_stream.inject_preroll(preroll)
                 self._turn_error = None
                 self._continue_conversation = False
                 self._turn_index = turns + 1
-                self._reset_barge_in_state()
-                tone_preroll = b""
-                if not preroll:
-                    tone_preroll = await self._play_turn_tone()
+                # Barge-in already has the caller talking; skip the beep so it
+                # does not talk over them. Gap preroll after TTS must not skip
+                # the tone — that cue is for the normal turn boundary.
+                if not self._barge_in_preroll:
+                    await self._play_turn_tone()
                     if not self._running:
                         break
-                if tone_preroll:
-                    self.audio_stream.inject_preroll(tone_preroll)
+                self._interrupt_media_when_ready()
+                preroll = self._take_preroll()
+                if preroll:
+                    self.audio_stream.inject_preroll(preroll)
                 LOGGER.debug(
                     "Assist turn %d listening (conversation_id=%s, preroll=%d B)",
                     self._turn_index,
@@ -385,7 +527,7 @@ class AssistBridge(AudioSink):
                 try:
                     await async_pipeline_from_audio_stream(
                         self.hass,
-                        context=Context(),
+                        context=self._context,
                         event_callback=self._on_pipeline_event,
                         stt_metadata=stt_metadata,
                         stt_stream=self.audio_stream,
@@ -395,6 +537,7 @@ class AssistBridge(AudioSink):
                         start_stage=PipelineStage.STT,
                         end_stage=PipelineStage.TTS,
                         conversation_extra_system_prompt=self.system_prompt,
+                        device_id=self._device_id,
                     )
                 finally:
                     self._listening = False
@@ -470,7 +613,7 @@ class AssistBridge(AudioSink):
             pipeline_input = PipelineInput(
                 run=PipelineRun(
                     self.hass,
-                    context=Context(),
+                    context=self._context,
                     pipeline=pipeline,
                     start_stage=PipelineStage.INTENT,
                     end_stage=PipelineStage.TTS,
@@ -479,29 +622,33 @@ class AssistBridge(AudioSink):
                 session=session,
                 intent_input=self.initial_prompt,
                 conversation_extra_system_prompt=self.system_prompt,
+                device_id=self._device_id,
             )
             await pipeline_input.validate()
             await pipeline_input.execute()
 
-    async def _play_turn_tone(self) -> bytes:
+    async def _play_turn_tone(self) -> None:
         """Play the turn-start beep and wait until it finishes.
 
         Failures and timeouts must not block the listening turn. The wait uses
         a dedicated event so tone completion cannot unblock TTS playback wait.
-        On timeout, any caller audio captured during the wait is returned as
-        preroll so speech is not lost on failure paths.
+        A completed beep drops gap capture so speakerphone echo of the tone
+        (and the TTS tail still in the ring) cannot reach STT; a timeout
+        keeps whatever the caller said during the wait.
         """
         if not self.turn_tone or self.play_source is None:
-            return b""
+            return
         self._tx_wait = "tone"
         self._tx_done.clear()
-        self._tone_capture = bytearray()
         timed_out = False
+        played = False
         try:
+            self._interrupt_media_when_ready()
             await self._wait_for_tx_idle()
             if not self._running:
-                return b""
+                return
             self.play_source(ToneAudioSource())
+            played = True
             try:
                 async with asyncio.timeout(_TONE_WAIT_TIMEOUT_SECONDS):
                     await self._tx_done.wait()
@@ -515,9 +662,8 @@ class AssistBridge(AudioSink):
             timed_out = True
         finally:
             self._tx_wait = None
-        if timed_out and self._tone_capture:
-            return bytes(self._tone_capture)
-        return b""
+        if played and not timed_out:
+            self._discard_gap_capture()
 
     async def _wait_playback_done(self) -> None:
         """Wait for TTS playback to finish before starting the next turn."""
@@ -539,6 +685,10 @@ class AssistBridge(AudioSink):
         self._tx_wait = None
         self._speaking = False
         if not ended_by_barge_in:
+            # Drop barge-in residue, then settle so speakerphone echo of the
+            # response is less likely to look like the next command. write()
+            # may keep RX in the ring; MicroVad (when loaded) withholds that
+            # preroll unless it heard speech.
             self._reset_barge_in_state()
             await asyncio.sleep(0.2)
 
@@ -590,23 +740,46 @@ class AssistBridge(AudioSink):
             LOGGER.error("Assist pipeline error: %s", event.data)
 
     async def _play_tts_stream(self, stream: tts.ResultStream, epoch: int) -> None:
-        """Fetch TTS stream WAV output and play it to the SIP caller."""
+        """Play TTS into RTP as soon as the first audio chunk arrives.
+
+        Later chunks are fed to ffmpeg stdin while PCM is already going out,
+        so the far end does not wait for the whole synthesis to finish.
+        """
         try:
-            chunks = []
-            async for chunk in stream.async_stream_result():
-                if epoch != self._tts_epoch:
-                    return
-                chunks.append(chunk)
+            agen = stream.async_stream_result()
+            try:
+                first = await anext(agen)
+            except StopAsyncIteration:
+                if epoch == self._tts_epoch:
+                    self._tx_done.set()
+                return
             if epoch != self._tts_epoch:
+                aclose = getattr(agen, "aclose", None)
+                if callable(aclose):
+                    await aclose()
                 return
 
-            wav_data = b"".join(chunks)
-            source = FfmpegAudioSource(data=wav_data, ffmpeg_bin=get_ffmpeg_bin(self.hass))
+            self._interrupt_media_when_ready()
+
+            async def chunks() -> AsyncIterable[bytes]:
+                if first:
+                    yield first
+                async for chunk in agen:
+                    if epoch != self._tts_epoch:
+                        return
+                    if chunk:
+                        yield chunk
+
             await self._wait_for_tx_idle()
             if epoch != self._tts_epoch:
                 return
+            source = FfmpegAudioSource(
+                chunks=chunks(), ffmpeg_bin=get_ffmpeg_bin(self.hass)
+            )
             self.play_source(source)
             self._tx_wait = "tts"
+        except asyncio.CancelledError:
+            raise
         except Exception as err:
             LOGGER.exception("Error playing Assist TTS response: %s", err)
             if epoch == self._tts_epoch:

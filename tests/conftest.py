@@ -1,5 +1,6 @@
 """pytest configuration — mock Home Assistant modules to allow testing without HA installed."""
 import sys
+import types
 from unittest.mock import MagicMock
 
 
@@ -10,6 +11,16 @@ class MockBase:
 
     def __class_getitem__(cls, item):
         return cls
+
+    async def async_added_to_hass(self):
+        return None
+
+
+class MockRestoreEntity:
+    """Separate base so SwitchEntity + RestoreEntity is a valid MRO."""
+
+    async def async_added_to_hass(self):
+        return None
 
 
 def mock_callback(func):
@@ -47,6 +58,8 @@ for mod in [
     "homeassistant.helpers.entity_registry",
     "homeassistant.helpers.dispatcher",
     "homeassistant.helpers.event",
+    "homeassistant.helpers.restore_state",
+    "homeassistant.helpers.entity_platform",
     "homeassistant.components",
     "homeassistant.components.websocket_api",
     "homeassistant.components.sensor",
@@ -59,3 +72,77 @@ for mod in [
     "homeassistant.util.dt",
 ]:
     sys.modules[mod] = MagicMock()
+
+# homeassistant.exceptions / auth constants: real exception classes so
+# integration code can raise/catch them and tests can assert on them.
+class HomeAssistantError(Exception):
+    pass
+
+
+class ServiceValidationError(HomeAssistantError):
+    pass
+
+
+class Unauthorized(HomeAssistantError):
+    def __init__(self, context=None, user_id=None, entity_id=None,
+                 config_entry_id=None, perm_category=None, permission=None):
+        super().__init__(self.__class__.__name__)
+        self.context = context
+        self.user_id = user_id
+        self.entity_id = entity_id
+        self.config_entry_id = config_entry_id
+        self.perm_category = perm_category
+        self.permission = permission
+
+
+class UnknownUser(Unauthorized):
+    pass
+
+
+_exceptions_mod = types.ModuleType("homeassistant.exceptions")
+_exceptions_mod.HomeAssistantError = HomeAssistantError
+_exceptions_mod.ServiceValidationError = ServiceValidationError
+_exceptions_mod.Unauthorized = Unauthorized
+_exceptions_mod.UnknownUser = UnknownUser
+sys.modules["homeassistant.exceptions"] = _exceptions_mod
+
+sys.modules["homeassistant.auth"] = MagicMock()
+sys.modules["homeassistant.auth.permissions"] = MagicMock()
+_auth_const_mod = types.ModuleType("homeassistant.auth.permissions.const")
+_auth_const_mod.CAT_ENTITIES = "entities"
+_auth_const_mod.POLICY_CONTROL = "control"
+_auth_const_mod.POLICY_READ = "read"
+sys.modules["homeassistant.auth.permissions.const"] = _auth_const_mod
+
+sys.modules["homeassistant.helpers.restore_state"].RestoreEntity = MockRestoreEntity
+sys.modules["homeassistant.components.switch"].SwitchEntity = MockBase
+
+
+class _TextSelectorType:
+    PASSWORD = "password"
+    TEXT = "text"
+
+
+class _TextSelectorConfig(dict):
+    def __init__(self, type=None, autocomplete=None, **kwargs):
+        super().__init__()
+        if type is not None:
+            self["type"] = type
+        if autocomplete is not None:
+            self["autocomplete"] = autocomplete
+        self.update(kwargs)
+
+
+class _TextSelector:
+    def __init__(self, config=None):
+        self.config = dict(config) if config is not None else {}
+
+    def __call__(self, data):
+        return data
+
+
+_selector_mod = types.ModuleType("homeassistant.helpers.selector")
+_selector_mod.TextSelector = _TextSelector
+_selector_mod.TextSelectorConfig = _TextSelectorConfig
+_selector_mod.TextSelectorType = _TextSelectorType
+sys.modules["homeassistant.helpers.selector"] = _selector_mod

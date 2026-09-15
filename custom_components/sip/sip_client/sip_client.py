@@ -13,16 +13,24 @@ import re
 import socket
 import time
 from dataclasses import dataclass
-from typing import Callable
+from typing import Any, Callable, Coroutine
 
 from . import codecs
 from . import sip_message as sm
-from .audio import AudioSink, AudioSource, NullSink
+from . import trace
+from .audio import AudioSink, AudioSource, NullSink, TeeSink
 from .rtp_session import RtpSession
 from .sip_auth import digest_response
 
 _LOGGER = logging.getLogger(__name__)
 USER_AGENT = "HomeAssistant-sip_client"
+
+# REGISTER retry: start at 10 s. Non-auth doubles to 5 min; 401/403/407
+# triples to 30 min so a bad password cannot trip fail2ban.
+REGISTER_RETRY_MIN = 10.0
+REGISTER_RETRY_MAX = 300.0
+REGISTER_AUTH_RETRY_MAX = 1800.0
+REGISTER_AUTH_CODES = frozenset({401, 403, 407})
 
 
 class SipState(enum.StrEnum):
@@ -48,6 +56,8 @@ class SipConfig:
     register_expiration: int = 300
     local_rtp_port: int = 7078
     outbound_proxy: str = ""
+    media_timeout: int = 30
+    max_call_duration: int = 3600
 
 
 @dataclass
@@ -57,12 +67,29 @@ class SipCallbacks:
     on_register_failed: Callable[[str], None] | None = None
     on_incoming_call: Callable[[str], None] | None = None
     on_call_connected: Callable[[], None] | None = None
-    on_call_ended: Callable[[], None] | None = None
+    on_call_ended: Callable[[str], None] | None = None
     on_dtmf: Callable[[str], None] | None = None
     on_playback_done: Callable[[], None] | None = None
+    # The source failed (ffmpeg error, no audio, unreadable URL). Consumers
+    # waiting on on_playback_done must be released; the argument is the
+    # error text.
+    on_playback_error: Callable[[str], None] | None = None
+    on_codec_change: Callable[[codecs.Codec], None] | None = None
 
 
+_HOLD_IPS = frozenset({"0.0.0.0", "0:0:0:0:0:0:0:0", "::"})
 _INFO_DTMF_TYPES = ("application/dtmf-relay", "application/dtmf", "audio/telephone-event")
+# How long stop() waits for cancelled sources / background work to finish.
+_STOP_DRAIN_TIMEOUT_SEC = 3.0
+_DIALOG_STATES = frozenset(
+    {
+        SipState.INVITING,
+        SipState.RINGING_OUT,
+        SipState.INCOMING,
+        SipState.ANSWERING,
+        SipState.IN_CALL,
+    }
+)
 
 
 def _dtmf_from_token(token: str) -> str | None:
@@ -122,11 +149,96 @@ def _angle_uri(value: str) -> str:
 # §19.1.1). Match it as a whole parameter so ";lrx" or a userinfo "lr" is not
 # mistaken for one.
 _LOOSE_ROUTE_PARAM = re.compile(r";lr(?=[;=?]|$)", re.IGNORECASE)
+_URL_IN_TEXT = re.compile(r"https?://\S+", re.IGNORECASE)
 
 
 def _is_loose_route(route: str) -> bool:
     """Whether a Record-Route/Route field-value points at a loose router."""
     return bool(_LOOSE_ROUTE_PARAM.search(_angle_uri(route) or route.strip()))
+
+
+def _public_playback_error(err: BaseException) -> str:
+    """Short reason for bus/logbook callbacks; never include media URLs.
+
+    FFmpeg stderr (appended after ``: ``) can contain Home Assistant
+    ``/media`` URLs with ``authSig``. The full exception is already logged.
+    """
+    text = str(err).strip() or err.__class__.__name__
+    if text.startswith("ffmpeg "):
+        text = text.split(":", 1)[0].strip()
+    text = _URL_IN_TEXT.sub("<url>", text)
+    return text[:200]
+
+
+def _cseq_number(header: str) -> int:
+    try:
+        return int(header.split()[0])
+    except (ValueError, IndexError):
+        return 0
+
+
+def _via_sent_by(via: str) -> str:
+    """host[:port] of the top Via (where the request came from)."""
+    first = via.split(",", 1)[0].strip()
+    parts = first.split(None, 1)
+    return parts[1].split(";", 1)[0].strip() if len(parts) == 2 else ""
+
+
+def _via_branch(via: str) -> str:
+    """Branch of the top Via (the transaction this request belongs to)."""
+    first = via.split(",", 1)[0]
+    match = re.search(r";branch=([^;,\s]+)", first, re.IGNORECASE)
+    return match.group(1) if match else ""
+
+
+def _answer_direction(sdp: sm.SdpInfo) -> str:
+    """RFC 3264 answer direction for a remote offer, including RFC 2543 hold."""
+    if sdp.direction == "inactive":
+        return "inactive"
+    if sdp.direction == "sendonly" or sdp.connection_ip in _HOLD_IPS:
+        return "recvonly"
+    if sdp.direction == "recvonly":
+        return "sendonly"
+    return "sendrecv"
+
+
+def _offered_codec_names(sdp: sm.SdpInfo) -> list[str]:
+    named = {"G722": sdp.g722_pt, "PCMU": sdp.pcmu_pt, "PCMA": sdp.pcma_pt}
+    names: list[str] = []
+    for codec in codecs.SUPPORTED:
+        if named[codec.name] >= 0 or codec.payload_type in sdp.offered_pts:
+            names.append(codec.name)
+    return names
+
+
+def _codec_mismatch(
+    remote_names: list[str], remote_pts: list[int], dtmf_pt: int
+) -> bool:
+    """True when the remote offer has audio we cannot negotiate."""
+    supported = {c.name for c in codecs.SUPPORTED}
+    if remote_names:
+        return supported.isdisjoint(remote_names)
+    audio_pts = {pt for pt in remote_pts if pt != dtmf_pt and pt != 13}
+    if not audio_pts:
+        return False
+    known = {c.payload_type for c in codecs.SUPPORTED}
+    return audio_pts.isdisjoint(known)
+
+
+def _audio_path(rx: int, tx: int) -> str:
+    if rx > 0 and tx > 0:
+        return "bidirectional"
+    if tx > 0 and rx == 0:
+        return "no_rx"
+    if rx > 0 and tx == 0:
+        return "no_tx"
+    return "none"
+
+
+def _fmt_diag_endpoint(addr: tuple[str, int] | None) -> str | None:
+    if not addr:
+        return None
+    return f"{addr[0]}:{addr[1]}"
 
 
 class _SipProtocol(asyncio.DatagramProtocol):
@@ -156,8 +268,17 @@ class SipClient:
         self.state = SipState.IDLE
         self.registered = False
         self.last_caller = ""
+        self.last_registered_at: float | None = None
+        self.last_register_failed: str | None = None
+        self.last_call_reason: str | None = None
+        self.last_call_bytes_rx = 0
+        self.last_call_bytes_tx = 0
+        self._remote_offered_pts: list[int] = []
+        self._remote_offered_names: list[str] = []
         self._register_handle: asyncio.TimerHandle | None = None
         self._reg_attempts = 0
+        self._register_backoff = REGISTER_RETRY_MIN
+        self._register_auth_failures = 0
 
         # registration transaction
         self._reg_call_id = ""
@@ -165,6 +286,7 @@ class SipClient:
         self._reg_branch = ""
         self._reg_cseq = 0
         self._register_auth_tried = False
+        self._reg_pending = False  # REGISTER sent, final response not yet seen
         self._service_routes: str | None = None
 
         # current dialog
@@ -181,6 +303,12 @@ class SipClient:
         self._incoming_invite: sm.SipMessage | None = None
         self._dialog_routes: list[str] = []
         self._accepted_dialog_to = ""
+        # Last INVITE we received in this dialog (initial or re-INVITE). Used
+        # to tell a retransmission (same CSeq + branch) from a re-INVITE.
+        self._remote_invite_cseq = 0
+        self._remote_invite_branch = ""
+        self._on_hold = False
+        self._local_direction = "sendrecv"
 
         # negotiated media
         self._remote_rtp_ip = ""
@@ -188,13 +316,26 @@ class SipClient:
         self._codec: codecs.Codec = codecs.DEFAULT
         self._chosen_pt = self._codec.payload_type
         self._remote_dtmf_pt = -1
+        self._sdp_negotiated = False
         self._media_active = False
+        self._media_lock = asyncio.Lock()
+        self._media_session = 0
+        self._media_owner: int | None = None
 
         self.rtp = RtpSession()
-        self.sink: AudioSink = NullSink()
+        self.rtp.media_timeout = float(self.config.media_timeout)
+        self.rtp.on_media_timeout = self._on_media_timeout
+        self.sink: AudioSink = TeeSink()
         self._tx_source_task: asyncio.Task | None = None
+        # A cancelled source may still be cleaning up an ffmpeg subprocess.
+        # Keep it alive until that cleanup has actually completed.
+        self._tx_source_tasks: set[asyncio.Task] = set()
+        # Fire-and-forget work (reconnect, media start/stop). The loop only
+        # keeps weak references to tasks, so hold them until they finish.
+        self._background_tasks: set[asyncio.Task] = set()
         self._pending_source: AudioSource | None = None
         self._ring_timeout_handle: asyncio.TimerHandle | None = None
+        self._max_duration_handle: asyncio.TimerHandle | None = None
         # INVITE retransmission (RFC 3261 over unreliable UDP)
         self._invite_msg: str | None = None
         self._invite_retx_handle: asyncio.TimerHandle | None = None
@@ -216,8 +357,90 @@ class SipClient:
     def media_playing(self) -> bool:
         return self._tx_source_task is not None and not self._tx_source_task.done()
 
+    @property
+    def register_auth_failures(self) -> int:
+        """Consecutive 401/403/407 REGISTER failures since the last success."""
+        return self._register_auth_failures
+
+    def add_sink(self, sink: AudioSink) -> None:
+        """Register an RX listener without replacing the others."""
+        if not isinstance(self.sink, TeeSink):
+            self.sink = TeeSink(self.sink)
+        self.sink.add(sink)
+
+    def remove_sink(self, sink: AudioSink) -> None:
+        """Unregister one RX listener; remaining sinks keep receiving."""
+        if isinstance(self.sink, TeeSink):
+            self.sink.remove(sink)
+            return
+        if self.sink is sink:
+            self.sink = TeeSink()
+
+    def clear_sinks(self) -> None:
+        """Drop every RX listener (call end / shutdown). Does not close them."""
+        if isinstance(self.sink, TeeSink):
+            self.sink.clear()
+        else:
+            self.sink = TeeSink()
+
     def set_sink(self, sink: AudioSink) -> None:
-        self.sink = sink
+        """Replace the sink chain with ``sink`` (``NullSink`` clears it)."""
+        self.clear_sinks()
+        if not isinstance(sink, NullSink):
+            self.add_sink(sink)
+
+    def diagnostics_snapshot(self) -> dict:
+        """Runtime SIP/RTP state for the HA diagnostics download (no secrets)."""
+        if self.rtp.running or self.state in _DIALOG_STATES:
+            # Live counters, including a dialog that has not started RTP yet
+            # (bind failure / offerless INVITE). Counters are cleared in
+            # _begin_dialog_media so this cannot inherit the previous call.
+            rx, tx = self.rtp.bytes_received, self.rtp.bytes_sent
+        else:
+            rx, tx = self.last_call_bytes_rx, self.last_call_bytes_tx
+        sdp = self.rtp.sdp_remote
+        if sdp is None and self._remote_rtp_ip:
+            sdp = (self._remote_rtp_ip, self._remote_rtp_port)
+        return {
+            "state": str(self.state),
+            "registration": {
+                "registered": self.registered,
+                "last_registered_at": self.last_registered_at,
+                "last_failure": self.last_register_failed,
+            },
+            "codec": {
+                "negotiated": self._codec.name,
+                "payload_type": self._codec.payload_type,
+                "sample_rate": self._codec.sample_rate,
+                "telephone_event_pt": self._remote_dtmf_pt,
+                "local_supported": [c.name for c in codecs.SUPPORTED],
+                "remote_offered": list(self._remote_offered_names),
+                "remote_offered_pts": list(self._remote_offered_pts),
+                "mismatch": _codec_mismatch(
+                    self._remote_offered_names,
+                    self._remote_offered_pts,
+                    self._remote_dtmf_pt,
+                ),
+            },
+            "rtp": {
+                "sdp_remote": _fmt_diag_endpoint(sdp),
+                "latched_remote": _fmt_diag_endpoint(self.rtp.latched_remote),
+                "bytes_received": rx,
+                "bytes_sent": tx,
+                "audio_path": _audio_path(rx, tx),
+                "expect_rx": self.rtp.expect_rx,
+                "tx_enabled": self.rtp.tx_enabled,
+                "running": self.rtp.running,
+            },
+            "call": {
+                "in_call": self.in_call,
+                "outbound": self._outbound,
+                "local_direction": self._local_direction,
+                "on_hold": self._on_hold,
+                "last_end_reason": self.last_call_reason,
+                "last_caller": self.last_caller,
+            },
+        }
 
     # -- lifecycle ------------------------------------------------------
     async def start(self) -> None:
@@ -225,7 +448,7 @@ class SipClient:
         if await self._open_socket():
             self._do_register()
         else:
-            self._emit("on_register_failed", "Connection failed")
+            self._register_failed("Connection failed")
             self._schedule_register(10)  # keep retrying; _register_timer recovers
 
     async def stop(self) -> None:
@@ -238,10 +461,27 @@ class SipClient:
             self._ring_timeout_handle.cancel()
             self._ring_timeout_handle = None
         await self._stop_media()
+        await self._drain_tasks()
         if self._transport is not None:
             self._transport.close()
             self._transport = None
         self._set_state(SipState.IDLE)
+
+    async def _drain_tasks(self, timeout: float = _STOP_DRAIN_TIMEOUT_SEC) -> None:
+        """Let cancelled sources finish their ffmpeg cleanup before the client
+        is discarded; whatever is still pending after ``timeout`` is cancelled."""
+        pending = {t for t in self._tx_source_tasks | self._background_tasks if not t.done()}
+        if not pending:
+            return
+        _done, still_pending = await asyncio.wait(pending, timeout=timeout)
+        if not still_pending:
+            return
+        for task in still_pending:
+            task.cancel()
+        # The first cancel is often consumed by run(); ffmpeg cleanup then
+        # awaits proc.wait() / stderr in finally. Wait for that to finish
+        # so stop() does not drop the client while the task is still pending.
+        await asyncio.wait(still_pending, timeout=timeout)
 
     async def _reconnect(self) -> None:
         """Rebuild the SIP socket and re-register (recovers from network loss)."""
@@ -253,6 +493,7 @@ class SipClient:
                 self._register_handle.cancel()
                 self._register_handle = None
             self.registered = False
+            self._reg_pending = False
             if self._transport is not None:
                 self._transport.close()
                 self._transport = None
@@ -308,9 +549,11 @@ class SipClient:
         _LOGGER.info("SIP socket bound, local %s:%s", self._local_ip, self._local_port)
         return True
 
-    def _send_raw(self, msg: str) -> None:
+    def _send_raw(self, msg: str, *, traced: bool = True) -> None:
         if self._transport is None:
             return
+        if traced:
+            trace.log_sip("TX", msg)
         self._transport.sendto(msg.encode("utf-8"))
 
 
@@ -324,11 +567,20 @@ class SipClient:
         except Exception:  # noqa: BLE001
             _LOGGER.exception("SIP callback %s raised", name)
 
+    def _spawn(self, coro: Coroutine[Any, Any, Any]) -> asyncio.Task:
+        """Schedule background work and keep a reference until it is done."""
+        task = self._loop.create_task(coro)
+        self._background_tasks.add(task)
+        task.add_done_callback(self._background_tasks.discard)
+        return task
+
     def _set_state(self, state: SipState) -> None:
         if self.state != state:
             _LOGGER.debug("state %s -> %s", self.state, state)
             self.state = state
             self._emit("on_state_change", state)
+            if state == SipState.IN_CALL:
+                self._arm_max_duration()
 
     # -- registration ---------------------------------------------------
     def _contact_uri(self) -> str:
@@ -371,8 +623,13 @@ class SipClient:
         self._reg_branch = sm.gen_branch()
         self._reg_cseq += 1
         self._register_auth_tried = False
+        self._reg_pending = True
         self._send_raw(self._build_register())
-        self._set_state(SipState.REGISTERING)
+        # A refresh of a live registration stays REGISTERED: the registrar
+        # still holds the binding, and flipping to REGISTERING every half
+        # expiry would churn state-change events for nothing.
+        if self.state != SipState.REGISTERED:
+            self._set_state(SipState.REGISTERING)
         self._schedule_register(5)  # retry window if no response
 
     def _schedule_register(self, seconds: float) -> None:
@@ -403,20 +660,20 @@ class SipClient:
         ):
             self._schedule_register(30)
             return
-        if self.state == SipState.REGISTERED:
-            self._do_register()  # periodic refresh
-        elif self.state == SipState.REGISTERING:
+        if self._reg_pending or self.state == SipState.REGISTERING:
             # No response in the window. Resend a few times, then rebuild the
             # socket to recover from a dead transport or a changed local IP.
             self._reg_attempts += 1
             if self._reg_attempts >= 3:
                 _LOGGER.warning("REGISTER unanswered; reconnecting socket")
                 self._reg_attempts = 0
-                self._loop.create_task(self._reconnect())
+                self._spawn(self._reconnect())
             else:
                 self._do_register()
+        elif self.state == SipState.REGISTERED:
+            self._do_register()  # periodic refresh
         else:  # IDLE: the socket is likely gone, rebuild it
-            self._loop.create_task(self._reconnect())
+            self._spawn(self._reconnect())
 
     def _handle_register_response(self, m: sm.SipMessage) -> None:
         try:
@@ -432,6 +689,9 @@ class SipClient:
             self._register_auth_tried = True
             self._send_raw(self._authorized_register(m))
             return
+        if m.status_code < 200:
+            return  # provisional; keep waiting for the final response
+        self._reg_pending = False
         if m.status_code == 423:
             # RFC 3261 §10.2.8 / §21.4.17: retry with Expires >= Min-Expires.
             min_expires = self._parse_min_expires(m)
@@ -449,19 +709,22 @@ class SipClient:
                 min_expires,
                 self.config.register_expiration,
             )
-            self.registered = False
-            self._reg_attempts = 0
-            self._emit(
-                "on_register_failed",
+            self._retry_after_register_failure(
+                423,
                 f"423 Interval Too Brief (Min-Expires={min_expires})",
             )
-            self._schedule_register(10)
             return
         if 200 <= m.status_code < 300:
             was = self.registered
             self.registered = True
+            self.last_register_failed = None
+            self.last_registered_at = time.time()
             self._reg_attempts = 0
-            self._set_state(SipState.REGISTERED)
+            self._register_backoff = REGISTER_RETRY_MIN
+            self._register_auth_failures = 0
+            # A refresh may now overlap a call; never clobber a call state.
+            if self.state == SipState.REGISTERING:
+                self._set_state(SipState.REGISTERED)
             self._schedule_register(max(self.config.register_expiration // 2, 30))
             if sr := m.header("Service-Route"):
                 self._service_routes = sr
@@ -470,11 +733,42 @@ class SipClient:
                 self._emit("on_registered")
             return
         _LOGGER.warning("REGISTER failed: %s %s", m.status_code, m.reason)
+        self._retry_after_register_failure(
+            m.status_code, f"{m.status_code} {m.reason}"
+        )
+
+    def _retry_after_register_failure(self, status: int, reason: str) -> None:
+        """Schedule the next REGISTER with exponential backoff.
+
+        Auth rejections grow faster (×3, cap 30 min) so a wrong password
+        cannot hammer the registrar. Other failures double up to 5 min.
+        """
+        auth = status in REGISTER_AUTH_CODES
+        delay = self._register_backoff
+        if auth:
+            self._register_auth_failures += 1
+            cap = REGISTER_AUTH_RETRY_MAX
+            factor = 3.0
+        else:
+            cap = REGISTER_RETRY_MAX
+            factor = 2.0
+        self._register_backoff = min(delay * factor, cap)
         self.registered = False
-        # The server responded, so the socket is alive: gentle retry, no reconnect.
         self._reg_attempts = 0
-        self._emit("on_register_failed", f"{m.status_code} {m.reason}")
-        self._schedule_register(10)
+        if self.state == SipState.REGISTERED:
+            self._set_state(SipState.REGISTERING)
+        self._register_failed(reason)
+        self._schedule_register(delay)
+        _LOGGER.info(
+            "REGISTER retry in %.0fs (next %.0fs, auth_failures=%s)",
+            delay,
+            self._register_backoff,
+            self._register_auth_failures,
+        )
+
+    def _register_failed(self, reason: str) -> None:
+        self.last_register_failed = reason
+        self._emit("on_register_failed", reason)
 
     def _authorized_register(self, m: sm.SipMessage) -> str:
         proxy = m.status_code == 407
@@ -513,6 +807,9 @@ class SipClient:
         self._invite_auth_tried = False
         self._dialog_routes = []
         self._accepted_dialog_to = ""
+        self._remote_invite_cseq = 0
+        self._remote_invite_branch = ""
+        self._begin_dialog_media()
         self._d_call_id = sm.gen_call_id(self._local_ip)
         self._d_local_tag = sm.gen_tag()
         self._d_branch = sm.gen_branch()
@@ -568,7 +865,7 @@ class SipClient:
         try:
             if self.state in (SipState.INVITING, SipState.RINGING_OUT):
                 _LOGGER.info("Ring timeout reached; canceling call")
-                self.hangup()
+                self.hangup(reason="ring_timeout")
         except Exception:  # noqa: BLE001
             _LOGGER.exception("Ring timeout handler error")
 
@@ -580,6 +877,8 @@ class SipClient:
         remote never offered (RFC 3264).
         """
         sid = str(int(time.time()))
+        # RFC 3264: answer sendonly with recvonly, inactive with inactive.
+        direction = self._local_direction
         return (
             "v=0\r\n"
             f"o=- {sid} {sid} IN IP4 {self._local_ip}\r\n"
@@ -590,7 +889,7 @@ class SipClient:
             f"{codecs.sdp_rtpmaps(only=only)}"
             "a=fmtp:101 0-15\r\n"
             "a=ptime:20\r\n"
-            "a=sendrecv\r\n"
+            f"a={direction}\r\n"
         )
 
     def _build_invite(self) -> str:
@@ -754,7 +1053,7 @@ class SipClient:
                     self.play_source(self._pending_source)
                     self._pending_source = None
 
-            self._loop.create_task(_start_and_play())
+            self._spawn(_start_and_play())
             self._set_state(SipState.IN_CALL)
             _LOGGER.info("Call connected")
             self._emit("on_call_connected")
@@ -763,7 +1062,7 @@ class SipClient:
         # >= 300 final failure
         self._send_raw(self._build_ack(m))
         _LOGGER.warning("Call failed: %s %s", m.status_code, m.reason)
-        self._end_call()
+        self._end_call("remote_reject")
 
     def _digest_auth_line(self, proxy, auth_user, realm, nonce, uri, resp, qop, nc, cnonce, opaque) -> str:
         head = "Proxy-Authorization: " if proxy else "Authorization: "
@@ -778,17 +1077,95 @@ class SipClient:
         return auth + "\r\n"
 
     def _apply_remote_sdp(self, sdp: sm.SdpInfo) -> None:
-        if sdp.connection_ip:
+        old_ip, old_port = self._remote_rtp_ip, self._remote_rtp_port
+        # RFC 2543 hold uses c=0.0.0.0; keep the last real destination.
+        if sdp.connection_ip and sdp.connection_ip not in _HOLD_IPS:
             self._remote_rtp_ip = sdp.connection_ip
-        self._remote_rtp_port = sdp.audio_port
-        self._codec = codecs.choose(sdp)
-        self._chosen_pt = self._codec.payload_type
-        self._remote_dtmf_pt = sdp.telephone_event_pt
+        if sdp.audio_port:
+            self._remote_rtp_port = sdp.audio_port
 
-        # Update RTP session with negotiated values
-        self.rtp.set_codec(self._codec)
-        if self._remote_dtmf_pt >= 0:
+        old_codec = self._codec
+        in_dialog = self._sdp_negotiated
+        # First SDP of a dialog picks the preferred codec. Later re-INVITE /
+        # UPDATE keep the current one when it is still offered.
+        if in_dialog:
+            new_codec = codecs.keep_or_choose(self._codec, sdp)
+        else:
+            new_codec = codecs.choose(sdp)
+        codec_changed = (
+            new_codec.name != old_codec.name
+            or new_codec.payload_type != old_codec.payload_type
+        )
+        self._codec = new_codec
+        self._chosen_pt = self._codec.payload_type
+        self._remote_offered_pts = sorted(sdp.offered_pts)
+        self._remote_offered_names = _offered_codec_names(sdp)
+        if sdp.valid:
+            self._sdp_negotiated = True
+            # Including -1: a new offer without telephone-event must not
+            # inherit the previous call's DTMF payload type.
+            self._remote_dtmf_pt = sdp.telephone_event_pt
             self.rtp.dtmf_pt = self._remote_dtmf_pt
+        if codec_changed:
+            self.rtp.set_codec(self._codec)
+            if old_codec.sample_rate != new_codec.sample_rate:
+                self.rtp.flush_tx_buffer()
+                if self._tx_source_task is not None:
+                    self._cancel_source()
+                    # Unblock Assist/IVR waiters; CancelledError skips the
+                    # normal on_playback_done at the end of _run_source.
+                    self._emit("on_playback_done")
+            if in_dialog:
+                _LOGGER.info(
+                    "Negotiated codec %s (pt=%s, %s Hz)",
+                    self._codec.name, self._codec.payload_type, self._codec.sample_rate,
+                )
+                self._emit("on_codec_change", self._codec)
+
+        self._local_direction = _answer_direction(sdp)
+        self._set_hold(sdp.is_hold)
+        self.rtp.set_expect_rx(self._local_direction != "sendonly")
+        self._sync_media_endpoint(old_ip, old_port)
+
+    def _begin_dialog_media(self) -> None:
+        """Clear per-call media state so the previous dialog cannot leak."""
+        self._codec = codecs.DEFAULT
+        self._chosen_pt = self._codec.payload_type
+        self._remote_dtmf_pt = -1
+        self._remote_offered_pts = []
+        self._remote_offered_names = []
+        self.rtp.dtmf_pt = -1
+        self._sdp_negotiated = False
+        self._remote_rtp_ip = ""
+        self._remote_rtp_port = 0
+        self._on_hold = False
+        self._local_direction = "sendrecv"
+        self.rtp.send_silence = True
+        self.rtp.clear_tx_pause()
+        self.rtp.set_expect_rx(True)
+        self.rtp.reset_byte_counters()
+
+    def _sync_media_endpoint(self, old_ip: str, old_port: int) -> None:
+        """Retarget a live RTP session, or start one once a real address arrives."""
+        if not self._remote_rtp_ip or not self._remote_rtp_port:
+            return
+        if self._media_active:
+            if (self._remote_rtp_ip, self._remote_rtp_port) != (old_ip, old_port):
+                self.rtp.set_remote(self._remote_rtp_ip, self._remote_rtp_port)
+            return
+        # Initial INVITE was offerless or c=0.0.0.0 so _start_media never
+        # bound a socket. A later re-INVITE / ACK / UPDATE can supply the
+        # real endpoint — start then, without tearing anything down.
+        if self.state in (SipState.IN_CALL, SipState.ANSWERING):
+            self._spawn(self._start_media())
+
+    def _set_hold(self, held: bool) -> None:
+        if held == self._on_hold:
+            return
+        self._on_hold = held
+        self.rtp.send_silence = not held
+        self.rtp.set_tx_enabled(not held)
+        _LOGGER.info("Remote %s the call", "held" if held else "resumed")
 
     # -- inbound requests ----------------------------------------------
     @staticmethod
@@ -826,9 +1203,10 @@ class SipClient:
         # dialog of a 18x included, not just the 2xx — must echo the request's
         # Record-Route and carry a Contact the peer can route in-dialog
         # requests to. Dropping either strands a proxy/SBC outside the dialog.
-        if req.method == "INVITE" and 101 <= code < 300:
-            if record_route := req.header("Record-Route"):
-                msg += f"Record-Route: {record_route}\r\n"
+        if req.method in ("INVITE", "UPDATE") and 101 <= code < 300:
+            if req.method == "INVITE":
+                if record_route := req.header("Record-Route"):
+                    msg += f"Record-Route: {record_route}\r\n"
             msg += f"Contact: {self._contact_uri()}\r\n"
         msg += f"User-Agent: {USER_AGENT}\r\n"
         if with_sdp:
@@ -840,21 +1218,117 @@ class SipClient:
             msg += "Content-Length: 0\r\n\r\n"
         return msg
 
+    def _handle_dialog_invite(self, m: sm.SipMessage) -> bool:
+        """Handle INVITE that belongs to the current dialog.
+
+        Returns True when the request was consumed (retransmission or re-INVITE).
+        """
+        if not self._d_call_id or m.header("Call-ID") != self._d_call_id:
+            return False
+        if self.state not in (SipState.INCOMING, SipState.ANSWERING, SipState.IN_CALL):
+            return False
+
+        cseq = _cseq_number(m.header("CSeq"))
+        branch = _via_branch(m.header("Via"))
+        # RFC 3261: re-INVITE raises CSeq. Accept higher-CSeq while ANSWERING
+        # too: a lost ACK is often followed by a media re-INVITE before the
+        # original transaction completes. Same CSeq + different branch is a
+        # non-standard re-INVITE some PBXes send; treat it as renegotiation
+        # only once the call is established.
+        established = self.state in (SipState.IN_CALL, SipState.ANSWERING)
+        is_reinvite = established and (
+            cseq > self._remote_invite_cseq
+            or (
+                self.state == SipState.IN_CALL
+                and cseq == self._remote_invite_cseq
+                and branch
+                and branch != self._remote_invite_branch
+            )
+        )
+        if is_reinvite:
+            self._handle_reinvite(m)
+            return True
+        if self.state == SipState.INCOMING:
+            self._send_raw(self._build_response(m, 180, "Ringing", False))
+        else:
+            # Replay 200 using this request's Via/CSeq so a lost 200 for the
+            # original INVITE or a re-INVITE still matches the transaction.
+            self._send_raw(self._build_response(m, 200, "OK", True))
+        return True
+
+    def _handle_reinvite(self, m: sm.SipMessage) -> None:
+        """Answer an in-dialog re-INVITE without restarting the media session."""
+        self._remote_invite_cseq = _cseq_number(m.header("CSeq"))
+        self._remote_invite_branch = _via_branch(m.header("Via"))
+        contact = _angle_uri(m.header("Contact"))
+        if contact:
+            self._d_remote_target = contact
+        if m.body.strip():
+            self._apply_remote_sdp(sm.parse_sdp(m.body))
+        _LOGGER.info("Accepted re-INVITE (cseq=%s)", self._remote_invite_cseq)
+        self._send_raw(self._build_response(m, 200, "OK", True))
+
+    def _handle_update(self, m: sm.SipMessage) -> None:
+        """Answer UPDATE; include an SDP answer when the request offered one."""
+        if not self._d_call_id or m.header("Call-ID") != self._d_call_id:
+            self._send_raw(
+                self._build_response(m, 481, "Call/Transaction Does Not Exist", False)
+            )
+            return
+        if self.state not in (SipState.IN_CALL, SipState.ANSWERING):
+            self._send_raw(
+                self._build_response(m, 481, "Call/Transaction Does Not Exist", False)
+            )
+            return
+        if m.body.strip():
+            self._apply_remote_sdp(sm.parse_sdp(m.body))
+            contact = _angle_uri(m.header("Contact"))
+            if contact:
+                self._d_remote_target = contact
+            self._send_raw(self._build_response(m, 200, "OK", True))
+            return
+        self._send_raw(self._build_response(m, 200, "OK", False))
+
+    def _is_current_dialog_request(self, m: sm.SipMessage) -> bool:
+        """Return whether an in-dialog request belongs to our current dialog.
+
+        Early dialogs count: _d_call_id is set when the INVITE is received
+        (INCOMING) or sent (INVITING), and a caller may BYE a ringing call.
+        Replying 481 to a request that *is* in our dialog would make the
+        remote tear the dialog down (RFC 3261 §12.2.1.2).
+        """
+        return bool(
+            self._d_call_id
+            and m.header("Call-ID") == self._d_call_id
+            and self.state in _DIALOG_STATES
+        )
+
+    def _cancel_matches_invite(self, m: sm.SipMessage) -> bool:
+        """Return whether CANCEL matches the pending initial INVITE transaction.
+
+        The INVITE server transaction lives until the ACK, so this also
+        matches in ANSWERING (200 sent); the caller decides whether a match
+        still cancels anything.
+        """
+        invite = self._incoming_invite
+        if self.state not in (SipState.INCOMING, SipState.ANSWERING) or invite is None:
+            return False
+        cancel_cseq = _cseq_number(m.header("CSeq"))
+        invite_cseq = _cseq_number(invite.header("CSeq"))
+        cancel_branch = _via_branch(m.header("Via"))
+        invite_branch = _via_branch(invite.header("Via"))
+        return bool(
+            m.header("Call-ID") == invite.header("Call-ID")
+            and cancel_cseq > 0
+            and cancel_cseq == invite_cseq
+            and cancel_branch
+            and cancel_branch == invite_branch
+        )
+
     def _handle_request(self, m: sm.SipMessage) -> None:
         method = m.method
         if method == "INVITE":
-            # Retransmitted INVITE for the dialog we're already handling (our
-            # provisional / 200 was lost): replay the appropriate response.
-            if (
-                not self._outbound
-                and self._incoming_invite is not None
-                and m.header("Call-ID") == self._d_call_id
-                and self.state in (SipState.INCOMING, SipState.ANSWERING, SipState.IN_CALL)
-            ):
-                if self.state == SipState.INCOMING:
-                    self._send_raw(self._build_response(m, 180, "Ringing", False))
-                else:
-                    self._send_raw(self._build_response(self._incoming_invite, 200, "OK", True))
+            if self._handle_dialog_invite(m):
                 return
             caller = self._extract_caller(m)
             self.last_caller = caller
@@ -862,7 +1336,7 @@ class SipClient:
                 if self.dnd:
                     _LOGGER.info("Call rejected due to DND: Busy Here")
                     self._emit("on_incoming_call", caller)
-                    self._emit("on_call_ended")
+                    self._emit("on_call_ended", "local")
                 self._send_raw(self._build_response(m, 486, "Busy Here", False))
                 return
             self._outbound = False
@@ -879,6 +1353,9 @@ class SipClient:
                 self._d_cseq = int(m.header("CSeq").split()[0])
             except (ValueError, IndexError):
                 self._d_cseq = 1
+            self._remote_invite_cseq = self._d_cseq
+            self._remote_invite_branch = _via_branch(m.header("Via"))
+            self._begin_dialog_media()
             self._apply_remote_sdp(sm.parse_sdp(m.body))
 
             # Check for standard Intercom/Doorbell auto-answer headers
@@ -908,7 +1385,7 @@ class SipClient:
                 self._send_raw(self._build_response(m, 100, "Trying", False))
                 self._set_state(SipState.ANSWERING)
                 self._send_raw(self._build_response(m, 200, "OK", True))
-                self._loop.create_task(self._start_media())
+                self._spawn(self._start_media())
                 self._emit("on_incoming_call", caller)
                 self._set_state(SipState.IN_CALL)
                 _LOGGER.info("Call auto-answered and connected")
@@ -923,6 +1400,12 @@ class SipClient:
             return
 
         if method == "ACK":
+            if self._d_call_id and m.header("Call-ID") != self._d_call_id:
+                return
+            # Offerless INVITE/re-INVITE: our 200 was the offer; the answer
+            # arrives in the ACK body (RFC 3261 §13.2.1 / §14.1).
+            if m.body.strip():
+                self._apply_remote_sdp(sm.parse_sdp(m.body))
             if self.state == SipState.ANSWERING:
                 self._set_state(SipState.IN_CALL)
                 _LOGGER.info("Call connected (inbound)")
@@ -930,23 +1413,51 @@ class SipClient:
             return
 
         if method == "BYE":
+            if not self._is_current_dialog_request(m):
+                self._send_raw(
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
+                )
+                return
             self._send_raw(self._build_response(m, 200, "OK", False))
             _LOGGER.info("Remote hung up")
-            self._end_call()
+            self._end_call("remote_bye")
             return
 
         if method == "CANCEL":
-            self._send_raw(self._build_response(m, 200, "OK", False))
-            if self.state == SipState.INCOMING and self._incoming_invite is not None:
+            if not self._cancel_matches_invite(m):
                 self._send_raw(
-                    self._build_response(self._incoming_invite, 487, "Request Terminated", False)
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
                 )
-                self._end_call()
+                return
+            self._send_raw(self._build_response(m, 200, "OK", False))
+            if self.state != SipState.INCOMING:
+                # Already answered (200 OK sent, awaiting ACK): the CANCEL
+                # matches the transaction but arrived too late to act on.
+                _LOGGER.debug("CANCEL after 200 OK ignored")
+                return
+            assert self._incoming_invite is not None
+            self._send_raw(
+                self._build_response(
+                    self._incoming_invite, 487, "Request Terminated", False
+                )
+            )
+            self._end_call("remote_cancel")
             return
 
         if method == "INFO":
             # Many ATAs / gateways signal DTMF out-of-band via SIP INFO instead
             # of RFC 2833 telephone-event packets.
+            if not self._is_current_dialog_request(m):
+                self._send_raw(
+                    self._build_response(
+                        m, 481, "Call/Transaction Does Not Exist", False
+                    )
+                )
+                return
             self._send_raw(self._build_response(m, 200, "OK", False))
             digit = _parse_info_dtmf(m.header("Content-Type"), m.body)
             if digit is None:
@@ -960,24 +1471,43 @@ class SipClient:
             self._on_rx_dtmf(digit)
             return
 
-        # OPTIONS / unknown in-dialog request: acknowledge.
+        if method == "UPDATE":
+            self._handle_update(m)
+            return
+
+        # Unknown in-dialog request: acknowledge.
         self._send_raw(self._build_response(m, 200, "OK", False))
+
+    def _handle_options(self, m: sm.SipMessage, raw: str) -> None:
+        """Answer a keepalive (PBX qualify) OPTIONS.
+
+        A 200 exchange is one trace line; anything else gets the full
+        RX/TX dump so the failure can be diagnosed.
+        """
+        code, reason = 200, "OK"
+        resp = self._build_response(m, code, reason, False)
+        if code == 200:
+            trace.log_keepalive(_via_sent_by(m.header("Via")) or "?", code, reason)
+            self._send_raw(resp, traced=False)
+            return
+        trace.log_sip("RX", raw)
+        self._send_raw(resp)
 
     # -- call control ---------------------------------------------------
     def answer(self) -> None:
         if self.state != SipState.INCOMING or self._incoming_invite is None:
             _LOGGER.warning("answer() ignored in state %s", self.state)
             return
-        self._loop.create_task(self._start_media())
+        self._spawn(self._start_media())
         self._send_raw(self._build_response(self._incoming_invite, 200, "OK", True))
         self._set_state(SipState.ANSWERING)
         _LOGGER.info("Answered")
 
-    def hangup(self, sip_code: int | None = None) -> None:
+    def hangup(self, sip_code: int | None = None, *, reason: str = "local") -> None:
         if self.state in (SipState.IN_CALL, SipState.ANSWERING):
             self._d_cseq += 1
             self._send_raw(self._build_in_dialog("BYE"))
-            self._end_call()
+            self._end_call(reason)
         elif self.state in (SipState.INVITING, SipState.RINGING_OUT):
             msg = (
                 f"CANCEL {self._d_remote_target} SIP/2.0\r\n"
@@ -990,7 +1520,7 @@ class SipClient:
                 "Content-Length: 0\r\n\r\n"
             )
             self._send_raw(msg)
-            self._end_call()
+            self._end_call(reason)
         elif self.state == SipState.INCOMING and self._incoming_invite is not None:
             code = sip_code or 603
             reasons = {
@@ -1001,9 +1531,9 @@ class SipClient:
                 486: "Busy Here",
                 603: "Decline",
             }
-            reason = reasons.get(code, "Decline")
-            self._send_raw(self._build_response(self._incoming_invite, code, reason, False))
-            self._end_call()
+            phrase = reasons.get(code, "Decline")
+            self._send_raw(self._build_response(self._incoming_invite, code, phrase, False))
+            self._end_call(reason)
 
     def _build_in_dialog(
         self,
@@ -1073,42 +1603,115 @@ class SipClient:
             return
         self.rtp.queue_dtmf(digits)
 
-    def _end_call(self) -> None:
+    def _end_call(self, reason: str = "local") -> None:
         self._cancel_invite_retx()
         if self._ring_timeout_handle is not None:
             self._ring_timeout_handle.cancel()
             self._ring_timeout_handle = None
-        self._loop.create_task(self._stop_media())
+        self._cancel_max_duration()
+        self.rtp._cancel_media_timeout()
+        self._on_hold = False
+        self._local_direction = "sendrecv"
+        self.rtp.send_silence = True
+        self.rtp.clear_tx_pause()
+        self.last_call_reason = reason
+        self.last_call_bytes_rx = self.rtp.bytes_received
+        self.last_call_bytes_tx = self.rtp.bytes_sent
+        ended_session = self._media_session
+        self._media_session += 1
+        self._spawn(self._stop_media_session(ended_session))
         self._set_state(SipState.REGISTERED if self.registered else SipState.IDLE)
-        self._emit("on_call_ended")
+        self._emit("on_call_ended", reason)
 
-    # -- media ----------------------------------------------------------
-    async def _start_media(self) -> None:
-        if self._media_active:
+    def _arm_max_duration(self) -> None:
+        self._cancel_max_duration()
+        seconds = self.config.max_call_duration
+        if seconds <= 0:
             return
-        if not self._remote_rtp_ip or not self._remote_rtp_port:
-            _LOGGER.warning("No remote RTP endpoint; media not started")
-            return
-        self.rtp.set_codec(self._codec)
-        self.rtp.dtmf_pt = self._remote_dtmf_pt
-        self.rtp.set_remote(self._remote_rtp_ip, self._remote_rtp_port)
-        self.rtp.on_audio = self._on_rx_audio
-        self.rtp.on_dtmf = self._on_rx_dtmf
-        if not await self.rtp.start(self.config.local_rtp_port):
-            return
-        self._media_active = True
-        _LOGGER.info(
-            "Media started: remote %s:%s pt=%s dtmf_pt=%s",
-            self._remote_rtp_ip, self._remote_rtp_port, self._chosen_pt, self._remote_dtmf_pt,
+        self._max_duration_handle = self._loop.call_later(
+            seconds, self._on_max_duration
         )
 
-    async def _stop_media(self) -> None:
-        self._cancel_source()
-        if not self._media_active:
-            await self.rtp.stop()
+    def _cancel_max_duration(self) -> None:
+        if self._max_duration_handle is not None:
+            self._max_duration_handle.cancel()
+            self._max_duration_handle = None
+
+    def _on_max_duration(self) -> None:
+        self._max_duration_handle = None
+        if self.state not in (SipState.IN_CALL, SipState.ANSWERING):
             return
+        _LOGGER.warning("Max call duration reached (%ss)", self.config.max_call_duration)
+        self.hangup(reason="max_duration")
+
+    def _on_media_timeout(self) -> None:
+        if self.state not in (SipState.IN_CALL, SipState.ANSWERING):
+            return
+        _LOGGER.warning("RTP media timeout")
+        self.hangup(reason="media_timeout")
+
+    # -- media ----------------------------------------------------------
+    def _apply_rtp_dest_if_changed(self) -> None:
+        """Retarget RTP if SDP moved the peer while a start was in flight."""
+        if not self._remote_rtp_ip or not self._remote_rtp_port:
+            return
+        dest = (self._remote_rtp_ip, self._remote_rtp_port)
+        if self.rtp.sdp_remote != dest:
+            self.rtp.set_remote(self._remote_rtp_ip, self._remote_rtp_port)
+
+    async def _start_media(self) -> None:
+        async with self._media_lock:
+            session = self._media_session
+            if self._media_active:
+                # Same dialog: ACK/UPDATE/re-INVITE can schedule a second
+                # start while the first is still binding. Do not bounce RTP.
+                if self._media_owner == session:
+                    self._apply_rtp_dest_if_changed()
+                    return
+                await self._stop_media_unlocked()
+            if not self._remote_rtp_ip or not self._remote_rtp_port:
+                _LOGGER.warning("No remote RTP endpoint; media not started")
+                return
+            self.rtp.set_codec(self._codec)
+            self.rtp.dtmf_pt = self._remote_dtmf_pt
+            self.rtp.set_remote(self._remote_rtp_ip, self._remote_rtp_port)
+            self.rtp.on_audio = self._on_rx_audio
+            self.rtp.on_dtmf = self._on_rx_dtmf
+            if not await self.rtp.start(self.config.local_rtp_port):
+                return
+            if session != self._media_session:
+                await self.rtp.stop()
+                return
+            # SDP may have moved the peer during create_datagram_endpoint.
+            self._apply_rtp_dest_if_changed()
+            self._media_active = True
+            self._media_owner = session
+            _LOGGER.info(
+                "Media started: remote %s:%s pt=%s dtmf_pt=%s",
+                self._remote_rtp_ip, self._remote_rtp_port, self._chosen_pt, self._remote_dtmf_pt,
+            )
+
+    async def _stop_media(self) -> None:
+        async with self._media_lock:
+            await self._stop_media_unlocked()
+
+    async def _stop_media_session(self, session: int) -> None:
+        """Stop RTP only if this session still owns the socket.
+
+        A hangup schedules this as a background task. The next call may
+        already have started media under a newer ``_media_session``; a late
+        stop must not tear that down.
+        """
+        async with self._media_lock:
+            if self._media_owner is not None and self._media_owner != session:
+                return
+            await self._stop_media_unlocked()
+
+    async def _stop_media_unlocked(self) -> None:
+        self._cancel_source()
         await self.rtp.stop()
         self._media_active = False
+        self._media_owner = None
 
     def _on_rx_audio(self, pcm_le: bytes) -> None:
         try:
@@ -1125,8 +1728,15 @@ class SipClient:
         if not self.in_call:
             _LOGGER.warning("play_source ignored: not in call")
             return
-        self._cancel_source()
-        self._tx_source_task = self._loop.create_task(self._run_source(source))
+        # Replacing a live source: the producer is paced ahead of RTP, so
+        # cancellation alone can leave up to the prebuffer window of the old
+        # source queued. PCM left over from an already-finished source is
+        # deliberately kept (stop_audio(flush=False) then play_source()).
+        self.stop_audio(flush=self.media_playing)
+        task = self._loop.create_task(self._run_source(source))
+        self._tx_source_task = task
+        self._tx_source_tasks.add(task)
+        task.add_done_callback(self._tx_source_tasks.discard)
 
     def stop_audio(self, *, flush: bool = False) -> None:
         """Stop the current TX audio source; optionally discard queued RTP PCM."""
@@ -1155,8 +1765,12 @@ class SipClient:
             self._emit("on_playback_done")
         except asyncio.CancelledError:
             raise
-        except Exception:  # noqa: BLE001
+        except Exception as err:  # noqa: BLE001
             _LOGGER.exception("Audio source error")
+            # Not on_playback_done: nothing finished playing. But IVR/Assist
+            # and "wait for playback then hang up" automations are blocked on
+            # completion, so give them a distinct signal to move on.
+            self._emit("on_playback_error", _public_playback_error(err))
 
     # -- packet dispatch ------------------------------------------------
     def _on_packet(self, data: bytes) -> None:
@@ -1164,8 +1778,16 @@ class SipClient:
         # take down the UDP listener or the integration.
         try:
             raw = data.decode("utf-8", errors="replace")
+            try:
+                m = sm.parse_sip_message(raw)
+            except Exception:
+                trace.log_sip("RX", raw)  # keep unparseable packets in the trace
+                raise
+            if m.is_request and m.method == "OPTIONS":
+                self._handle_options(m, raw)  # traces itself
+                return
+            trace.log_sip("RX", raw)
 
-            m = sm.parse_sip_message(raw)
             if m.is_request:
                 self._handle_request(m)
                 return
